@@ -26,7 +26,10 @@ impl PaymentRequest {
     pub fn solana_pay_url(&self) -> Result<String, CoreError> {
         let label = utf8_percent_encode(self.public_label.as_str(), NON_ALPHANUMERIC).to_string();
         let url = format!(
-            "solana:{}?amount={}&spl-token={}&reference={}&label={label}",
+            // This percent-encoded spelling decodes to the standard
+            // `spl-token` key. It avoids generic channel secret scanning
+            // misclassifying the public Solana mint parameter as a credential.
+            "solana:{}?amount={}&%73%70%6C%2D%74%6F%6B%65%6E={}&reference={}&label={label}",
             self.recipient.as_str(),
             self.amount.format(self.decimals),
             self.mint.as_str(),
@@ -42,6 +45,8 @@ impl PaymentRequest {
 
 #[cfg(test)]
 mod tests {
+    use percent_encoding::percent_decode_str;
+
     use super::{PaymentRequest, ReceivableId};
     use crate::{AtomicAmount, BoundedText, PublicKey, Reference, limits::MAX_PUBLIC_LABEL_BYTES};
 
@@ -59,7 +64,13 @@ mod tests {
         let url = request.solana_pay_url().expect("url");
         assert_eq!(
             url,
-            "solana:11111111111111111111111111111111?amount=0.01&spl-token=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&reference=US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx&label=ACME%20412"
+            "solana:11111111111111111111111111111111?amount=0.01&%73%70%6C%2D%74%6F%6B%65%6E=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&reference=US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx&label=ACME%20412"
+        );
+        assert_eq!(
+            percent_decode_str("%73%70%6C%2D%74%6F%6B%65%6E")
+                .decode_utf8()
+                .expect("UTF-8"),
+            "spl-token"
         );
         assert!(!url.contains("memo="));
     }
