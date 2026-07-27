@@ -1,0 +1,16 @@
+# Add this server entry to your existing ZeroClaw configuration. Replace both
+# absolute paths. Keep `recebi.example.toml` outside this repository after
+# configuring it with your trusted endpoint and identities.
+
+[[mcp.servers]]
+name = "recebi"
+transport = "stdio"
+command = "/absolute/path/to/recebi-mcp"
+args = ["--config", "/absolute/path/to/recebi.toml"]
+tool_timeout_secs = 5
+
+[mcp_bundles.recebi]
+servers = ["recebi"]
+
+# Add `recebi` to the intended existing agent's `mcp_bundles` list. Do not
+# expose the tool on agents that do not need Recebi operational visibility.

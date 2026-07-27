@@ -1,0 +1,13 @@
+# Copy outside the repository and replace placeholder values. Tool calls cannot
+# override any value in this trusted local configuration.
+
+[recebi]
+cluster = "devnet"
+merchant_wallet = "11111111111111111111111111111111"
+accepted_mint = "11111111111111111111111111111111"
+token_decimals = 6
+rpc_url = "https://api.devnet.solana.com"
+# Use an absolute directory because ZeroClaw may spawn the process elsewhere.
+data_dir = "/absolute/path/to/recebi-data"
+ptax_policy = "strict_same_day"
+max_open_reconcile = 10
