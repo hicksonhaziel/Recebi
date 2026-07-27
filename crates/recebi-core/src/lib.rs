@@ -8,4 +8,7 @@ pub mod limits;
 pub mod model;
 
 pub use error::CoreError;
-pub use model::{AtomicAmount, BoundedText, Provenance, PublicKey, ReceivableState};
+pub use model::{
+    AtomicAmount, BoundedText, PaymentRequest, Provenance, PublicKey, ReceivableId,
+    ReceivableState, Reference,
+};

@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::health::HealthService;
+use crate::receivable::{CreateRequestInput, ReceivableService};
 
 const MAX_MCP_INPUT_BYTES: usize = 16 * 1024;
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -15,7 +16,7 @@ pub enum McpError {
     Stdio,
 }
 
-pub fn serve(health: &HealthService) -> Result<(), McpError> {
+pub fn serve(health: &HealthService, receivables: &ReceivableService) -> Result<(), McpError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     for line in stdin.lock().split(b'\n') {
@@ -32,7 +33,7 @@ pub fn serve(health: &HealthService) -> Result<(), McpError> {
             let request = serde_json::from_slice(&line);
             Some(match request {
                 Ok(request) if is_notification(&request) => continue,
-                Ok(request) => dispatch(health, &request),
+                Ok(request) => dispatch(health, receivables, &request),
                 Err(_) => error_response(&Value::Null, -32700, "parse_error"),
             })
         };
@@ -54,7 +55,7 @@ fn is_notification(request: &Value) -> bool {
         && request.get("id").is_none()
 }
 
-fn dispatch(health: &HealthService, request: &Value) -> Value {
+fn dispatch(health: &HealthService, receivables: &ReceivableService, request: &Value) -> Value {
     let Some(object) = request.as_object() else {
         return error_response(&Value::Null, -32600, "invalid_request");
     };
@@ -73,20 +74,35 @@ fn dispatch(health: &HealthService, request: &Value) -> Value {
             }),
         ),
         "ping" => success_response(&id, &json!({})),
-        "tools/list" => success_response(&id, &json!({"tools": [health_tool_schema()]})),
-        "tools/call" => call_tool(health, &id, object.get("params")),
+        "tools/list" => success_response(
+            &id,
+            &json!({"tools": [health_tool_schema(), create_request_tool_schema()]}),
+        ),
+        "tools/call" => call_tool(health, receivables, &id, object.get("params")),
         _ => error_response(&id, -32601, "method_not_found"),
     }
 }
 
-fn call_tool(health: &HealthService, id: &Value, params: Option<&Value>) -> Value {
+fn call_tool(
+    health: &HealthService,
+    receivables: &ReceivableService,
+    id: &Value,
+    params: Option<&Value>,
+) -> Value {
     let Some(params) = params.and_then(Value::as_object) else {
         return error_response(id, -32602, "invalid_tool_request");
     };
-    if params.get("name").and_then(Value::as_str) != Some("recebi_health") {
-        return error_response(id, -32602, "unknown_tool");
+    match params.get("name").and_then(Value::as_str) {
+        Some("recebi_health") => call_health(health, id, params.get("arguments")),
+        Some("recebi_create_request") => {
+            call_create_request(receivables, id, params.get("arguments"))
+        }
+        _ => error_response(id, -32602, "unknown_tool"),
     }
-    if let Some(arguments) = params.get("arguments")
+}
+
+fn call_health(health: &HealthService, id: &Value, arguments: Option<&Value>) -> Value {
+    if let Some(arguments) = arguments
         && arguments
             .as_object()
             .is_none_or(|arguments| !arguments.is_empty())
@@ -111,11 +127,51 @@ fn call_tool(health: &HealthService, id: &Value, params: Option<&Value>) -> Valu
     }
 }
 
+fn call_create_request(
+    receivables: &ReceivableService,
+    id: &Value,
+    arguments: Option<&Value>,
+) -> Value {
+    let Some(arguments) = arguments else {
+        return error_response(id, -32602, "invalid_create_request_arguments");
+    };
+    let Ok(input) = serde_json::from_value::<CreateRequestInput>(arguments.clone()) else {
+        return error_response(id, -32602, "invalid_create_request_arguments");
+    };
+    match receivables.create(input) {
+        Ok(result) => success_response(
+            id,
+            &json!({"content": [{"type": "text", "text": serde_json::to_string(&result).expect("serializable create result")}], "isError": false}),
+        ),
+        Err(error) => success_response(
+            id,
+            &json!({"content": [{"type": "text", "text": format!("{{\"status\":\"error\",\"reason\":\"{}\"}}", error)}], "isError": true}),
+        ),
+    }
+}
+
 fn health_tool_schema() -> Value {
     json!({
         "name": "recebi_health",
         "description": "Validate trusted local Recebi configuration and local data-directory availability. It has no financial capability.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+    })
+}
+
+fn create_request_tool_schema() -> Value {
+    json!({
+        "name": "recebi_create_request",
+        "description": "Create or return a durable, reference-bound USDC receivable. It never signs, submits, or refunds a transaction.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "receivable_id": {"type": "string", "maxLength": 64},
+                "amount": {"type": "string", "description": "Positive decimal USDC amount; no exponent notation."},
+                "public_label": {"type": "string", "maxLength": 120, "description": "Public wallet-display label; do not include sensitive data."}
+            },
+            "required": ["receivable_id", "amount", "public_label"],
+            "additionalProperties": false
+        }
     })
 }
 
@@ -145,14 +201,13 @@ fn encode_response(response: &Value) -> Vec<u8> {
 mod tests {
     use serde_json::json;
 
-    use super::{dispatch, encode_response, health_tool_schema};
-    use crate::{config::AppConfig, health::HealthService};
+    use super::{create_request_tool_schema, dispatch, encode_response, health_tool_schema};
+    use crate::{config::AppConfig, health::HealthService, receivable::ReceivableService};
 
-    fn health() -> HealthService {
+    fn services() -> (tempfile::TempDir, HealthService, ReceivableService) {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config_path = directory.path().join("recebi.toml");
-        std::fs::write(
-            &config_path,
+        let config = format!(
             r#"
 [recebi]
 cluster = "devnet"
@@ -160,37 +215,52 @@ merchant_wallet = "11111111111111111111111111111111"
 accepted_mint = "11111111111111111111111111111111"
 token_decimals = 6
 rpc_url = "https://api.devnet.solana.com"
-data_dir = "."
+data_dir = "{}"
 ptax_policy = "strict_same_day"
 max_open_reconcile = 10
 "#,
-        )
-        .expect("write config");
-        HealthService::new(AppConfig::load(&config_path).expect("load config"))
+            directory.path().join("data").display(),
+        );
+        std::fs::write(&config_path, config).expect("write config");
+        let config = AppConfig::load(&config_path).expect("load config");
+        let health = HealthService::new(config.clone());
+        let receivables = ReceivableService::new(config).expect("receivables");
+        (directory, health, receivables)
     }
 
     #[test]
-    fn only_health_is_discoverable_and_it_has_no_input_surface() {
-        let schema = health_tool_schema();
-        assert_eq!(schema["name"], "recebi_health");
-        assert_eq!(schema["inputSchema"]["properties"], json!({}));
-        assert_eq!(schema["inputSchema"]["additionalProperties"], false);
-        let schema_text = schema.to_string();
+    fn only_bounded_non_custodial_tools_are_discoverable() {
+        let health_schema = health_tool_schema();
+        assert_eq!(health_schema["name"], "recebi_health");
+        assert_eq!(health_schema["inputSchema"]["properties"], json!({}));
+        assert_eq!(health_schema["inputSchema"]["additionalProperties"], false);
+        let create_schema = create_request_tool_schema();
+        assert_eq!(create_schema["name"], "recebi_create_request");
+        let schema_keys = create_schema["inputSchema"]["properties"]
+            .as_object()
+            .expect("properties object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
         for forbidden_surface in ["wallet", "private_key", "sign", "submit", "refund"] {
-            assert!(!schema_text.contains(forbidden_surface));
+            assert!(!schema_keys.contains(forbidden_surface));
         }
     }
 
     #[test]
     fn malformed_envelope_is_rejected() {
-        let result = dispatch(&health(), &json!({"jsonrpc": "2.0", "id": 1}));
+        let (_directory, health, receivables) = services();
+        let result = dispatch(&health, &receivables, &json!({"jsonrpc": "2.0", "id": 1}));
         assert_eq!(result["error"]["message"], "invalid_request");
     }
 
     #[test]
     fn health_rejects_configuration_override_arguments() {
+        let (_directory, health, receivables) = services();
         let result = dispatch(
-            &health(),
+            &health,
+            &receivables,
             &json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {"name": "recebi_health", "arguments": {"rpc_url": "https://attacker.invalid"}},
@@ -199,6 +269,23 @@ max_open_reconcile = 10
         assert_eq!(
             result["error"]["message"],
             "recebi_health_accepts_no_arguments"
+        );
+    }
+
+    #[test]
+    fn create_rejects_memo_and_configuration_override_input() {
+        let (_directory, health, receivables) = services();
+        let result = dispatch(
+            &health,
+            &receivables,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "recebi_create_request", "arguments": {"receivable_id": "ACME-412", "amount": "0.1", "public_label": "ACME", "memo": "private", "rpc_url": "https://attacker.invalid"}},
+            }),
+        );
+        assert_eq!(
+            result["error"]["message"],
+            "invalid_create_request_arguments"
         );
     }
 

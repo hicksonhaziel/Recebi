@@ -1,6 +1,7 @@
 mod config;
 mod health;
 mod mcp;
+mod receivable;
 
 use clap::Parser;
 use config::AppConfig;
@@ -22,8 +23,15 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let health = health::HealthService::new(config);
-    if let Err(error) = mcp::serve(&health) {
+    let health = health::HealthService::new(config.clone());
+    let receivables = match receivable::ReceivableService::new(config) {
+        Ok(service) => service,
+        Err(error) => {
+            eprintln!("recebi-mcp storage error: {error}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(error) = mcp::serve(&health, &receivables) {
         eprintln!("recebi-mcp server error: {error}");
         std::process::exit(3);
     }

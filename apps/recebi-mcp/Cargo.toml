@@ -8,7 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 clap.workspace = true
+getrandom.workspace = true
 recebi-core = { path = "../../crates/recebi-core" }
+recebi-store = { path = "../../crates/recebi-store" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

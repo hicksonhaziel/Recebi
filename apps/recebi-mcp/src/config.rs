@@ -146,6 +146,11 @@ impl AppConfig {
             Err(ConfigError::DataDirectoryUnavailable)
         }
     }
+
+    #[must_use]
+    pub fn database_path(&self) -> PathBuf {
+        self.recebi.data_dir.join("recebi.sqlite3")
+    }
 }
 
 #[cfg(test)]
