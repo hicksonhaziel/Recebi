@@ -1,0 +1,4 @@
+# Local product/control documents. These guide Codex sessions but are not
+# repository artifacts and must never be committed.
+/RECEBI_PLAN.md
+/RECEBI_CONTEXT.md
