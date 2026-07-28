@@ -4,6 +4,8 @@ use thiserror::Error;
 pub enum CoreError {
     #[error("invalid public key")]
     InvalidPublicKey,
+    #[error("invalid cluster genesis hash")]
+    InvalidGenesisHash,
     #[error("text is empty")]
     EmptyText,
     #[error("text exceeds configured limit")]

@@ -7,18 +7,27 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
+bs58.workspace = true
 clap.workspace = true
 getrandom.workspace = true
 recebi-core = { path = "../../crates/recebi-core" }
 recebi-store = { path = "../../crates/recebi-store" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 url.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
+solana-message.workspace = true
+solana-signature.workspace = true
+solana-transaction.workspace = true
+spl-token-interface.workspace = true
 tempfile.workspace = true
+wincode.workspace = true
 
 [lints]
 workspace = true

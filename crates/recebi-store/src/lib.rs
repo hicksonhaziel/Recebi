@@ -6,7 +6,7 @@ use std::{
 
 use recebi_core::{
     AtomicAmount, BoundedText, PaymentRequest, PublicKey, ReceivableId, ReceivableState, Reference,
-    limits::MAX_PUBLIC_LABEL_BYTES,
+    SettlementEvidence, limits::MAX_PUBLIC_LABEL_BYTES,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -25,6 +25,12 @@ pub enum StoreError {
     ReferenceReuse,
     #[error("ledger integrity check failed")]
     Integrity,
+    #[error("receivable state does not allow this transition")]
+    InvalidTransition,
+    #[error("settlement signature or reference was already consumed")]
+    Replay,
+    #[error("another reconciliation is already running")]
+    ReconciliationBusy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,6 +39,12 @@ pub struct StoredReceivable {
     pub state: ReceivableState,
     pub created_at_unix_ms: i64,
     pub solana_pay_url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredReviewCandidate {
+    pub signature: String,
+    pub verdict: String,
 }
 
 #[derive(Clone, Debug)]
@@ -60,7 +72,7 @@ impl ReceivableStore {
                  decimals INTEGER NOT NULL,
                  reference TEXT NOT NULL UNIQUE,
                  public_label TEXT NOT NULL,
-                 state TEXT NOT NULL CHECK(state = 'open'),
+                 state TEXT NOT NULL CHECK(state IN ('open','payment_verified','needs_review')),
                  created_at_unix_ms INTEGER NOT NULL,
                  solana_pay_url TEXT NOT NULL
              );
@@ -75,9 +87,37 @@ impl ReceivableStore {
              );
              CREATE TRIGGER IF NOT EXISTS receivable_events_no_update BEFORE UPDATE ON receivable_events BEGIN SELECT RAISE(ABORT, 'append_only'); END;
              CREATE TRIGGER IF NOT EXISTS receivable_events_no_delete BEFORE DELETE ON receivable_events BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TABLE IF NOT EXISTS settlements (
+                 receivable_id TEXT PRIMARY KEY NOT NULL,
+                 signature TEXT NOT NULL UNIQUE,
+                 reference TEXT NOT NULL UNIQUE,
+                 slot INTEGER NOT NULL,
+                 block_time_unix INTEGER,
+                 recipient TEXT NOT NULL,
+                 mint TEXT NOT NULL,
+                 atomic_amount INTEGER NOT NULL,
+                 instruction_position INTEGER NOT NULL,
+                 fingerprint TEXT NOT NULL UNIQUE,
+                 observed_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS review_candidates (
+                 receivable_id TEXT PRIMARY KEY NOT NULL,
+                 signature TEXT NOT NULL,
+                 slot INTEGER NOT NULL,
+                 verdict TEXT NOT NULL,
+                 candidate_fingerprint TEXT NOT NULL UNIQUE,
+                 observed_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS reconciliation_lease (
+                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                 owner TEXT NOT NULL,
+                 expires_at_unix_ms INTEGER NOT NULL
+             );
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
+             INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);
              COMMIT;",
         ).map_err(|_| StoreError::Unavailable)?;
+        migrate_state_constraint(&connection)?;
         Ok(store)
     }
 
@@ -161,6 +201,292 @@ impl ReceivableStore {
         find_in(&self.connection()?, receivable_id.as_str())
     }
 
+    /// Returns open receivables in deterministic creation order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted storage or integrity error.
+    pub fn list_open(&self, limit: usize) -> Result<Vec<StoredReceivable>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT receivable_id FROM receivables WHERE state = 'open'
+                 ORDER BY created_at_unix_ms, receivable_id LIMIT ?1",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        let ids = statement
+            .query_map(
+                [i64::try_from(limit).map_err(|_| StoreError::Unavailable)?],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| StoreError::Unavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::Unavailable)?;
+        ids.into_iter()
+            .map(|id| find_in(&connection, &id)?.ok_or(StoreError::Integrity))
+            .collect()
+    }
+
+    /// Atomically records exact settlement evidence and consumes both the
+    /// signature and reference.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on replay, stale state, or storage failure.
+    pub fn mark_payment_verified(
+        &self,
+        receivable_id: &ReceivableId,
+        reference: &Reference,
+        evidence: &SettlementEvidence,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Unavailable)?;
+        let state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM receivables WHERE receivable_id = ?1",
+                [receivable_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?;
+        match state.as_deref() {
+            Some("payment_verified") => {
+                let existing: Option<String> = transaction
+                    .query_row(
+                        "SELECT fingerprint FROM settlements WHERE receivable_id = ?1",
+                        [receivable_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|_| StoreError::Unavailable)?;
+                return if existing.as_deref() == Some(&evidence.fingerprint) {
+                    transaction.commit().map_err(|_| StoreError::Unavailable)
+                } else {
+                    Err(StoreError::InvalidTransition)
+                };
+            }
+            Some("open") => {}
+            Some(_) => return Err(StoreError::InvalidTransition),
+            None => return Err(StoreError::Integrity),
+        }
+        let inserted = transaction.execute(
+            "INSERT INTO settlements (
+                receivable_id,signature,reference,slot,block_time_unix,recipient,mint,
+                atomic_amount,instruction_position,fingerprint,observed_at_unix_ms
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                receivable_id.as_str(),
+                evidence.signature,
+                reference.as_base58(),
+                i64::try_from(evidence.slot).map_err(|_| StoreError::Unavailable)?,
+                evidence.block_time_unix,
+                evidence.recipient.as_str(),
+                evidence.mint.as_str(),
+                i64::try_from(evidence.amount.get()).map_err(|_| StoreError::Unavailable)?,
+                i64::try_from(evidence.transfer_instruction_position)
+                    .map_err(|_| StoreError::Unavailable)?,
+                evidence.fingerprint,
+                observed_at_unix_ms
+            ],
+        );
+        if inserted.is_err() {
+            return Err(StoreError::Replay);
+        }
+        transaction
+            .execute(
+                "UPDATE receivables SET state = 'payment_verified' WHERE receivable_id = ?1 AND state = 'open'",
+                [receivable_id.as_str()],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        append_event(
+            &transaction,
+            receivable_id,
+            format!(
+                "event=payment_verified\nsignature={}\nslot={}\nfingerprint={}\nobserved_at_unix_ms={observed_at_unix_ms}\n",
+                evidence.signature, evidence.slot, evidence.fingerprint
+            )
+            .as_bytes(),
+        )?;
+        transaction.commit().map_err(|_| StoreError::Unavailable)
+    }
+
+    /// Atomically records a bounded mismatch without treating it as payment.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on stale state or storage failure.
+    pub fn mark_needs_review(
+        &self,
+        receivable_id: &ReceivableId,
+        signature: &str,
+        slot: u64,
+        verdict: &str,
+        candidate_fingerprint: &str,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Unavailable)?;
+        let changed = transaction
+            .execute(
+                "UPDATE receivables SET state = 'needs_review' WHERE receivable_id = ?1 AND state = 'open'",
+                [receivable_id.as_str()],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        if changed != 1 {
+            return Err(StoreError::InvalidTransition);
+        }
+        transaction
+            .execute(
+                "INSERT INTO review_candidates (
+                    receivable_id,signature,slot,verdict,candidate_fingerprint,observed_at_unix_ms
+                 ) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    receivable_id.as_str(),
+                    signature,
+                    i64::try_from(slot).map_err(|_| StoreError::Unavailable)?,
+                    verdict,
+                    candidate_fingerprint,
+                    observed_at_unix_ms
+                ],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        append_event(
+            &transaction,
+            receivable_id,
+            format!(
+                "event=needs_review\nsignature={signature}\nslot={slot}\nverdict={verdict}\ncandidate_fingerprint={candidate_fingerprint}\nobserved_at_unix_ms={observed_at_unix_ms}\n"
+            )
+            .as_bytes(),
+        )?;
+        transaction.commit().map_err(|_| StoreError::Unavailable)
+    }
+
+    /// Acquires the singleton reconciliation lease, replacing only an expired
+    /// lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReconciliationBusy` when another live run owns the lease.
+    pub fn acquire_reconciliation_lease(
+        &self,
+        owner: &str,
+        now_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        let changed = connection
+            .execute(
+                "INSERT INTO reconciliation_lease(singleton,owner,expires_at_unix_ms)
+                 VALUES (1,?1,?2)
+                 ON CONFLICT(singleton) DO UPDATE SET owner=excluded.owner,
+                 expires_at_unix_ms=excluded.expires_at_unix_ms
+                 WHERE reconciliation_lease.expires_at_unix_ms <= ?3",
+                params![owner, expires_at_unix_ms, now_unix_ms],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::ReconciliationBusy)
+        }
+    }
+
+    /// Releases only the caller's reconciliation lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted storage error.
+    pub fn release_reconciliation_lease(&self, owner: &str) -> Result<(), StoreError> {
+        self.connection()?
+            .execute(
+                "DELETE FROM reconciliation_lease WHERE singleton = 1 AND owner = ?1",
+                [owner],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(())
+    }
+
+    /// Returns whether a signature or reference already has durable settlement
+    /// evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted storage error.
+    pub fn replay_state(
+        &self,
+        signature: &str,
+        reference: &Reference,
+    ) -> Result<(bool, bool), StoreError> {
+        let connection = self.connection()?;
+        let signature_used = connection
+            .query_row(
+                "SELECT 1 FROM settlements WHERE signature = ?1",
+                [signature],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?
+            .is_some();
+        let reference_used = connection
+            .query_row(
+                "SELECT 1 FROM settlements WHERE reference = ?1",
+                [reference.as_base58()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?
+            .is_some();
+        Ok((signature_used, reference_used))
+    }
+
+    /// Returns the durable signature for a verified receivable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted storage error.
+    pub fn settlement_signature(
+        &self,
+        receivable_id: &ReceivableId,
+    ) -> Result<Option<String>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT signature FROM settlements WHERE receivable_id = ?1",
+                [receivable_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)
+    }
+
+    /// Returns the bounded candidate summary for a receivable in review.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted storage error.
+    pub fn review_candidate(
+        &self,
+        receivable_id: &ReceivableId,
+    ) -> Result<Option<StoredReviewCandidate>, StoreError> {
+        self.connection()?
+            .query_row(
+                "SELECT signature,verdict FROM review_candidates WHERE receivable_id = ?1",
+                [receivable_id.as_str()],
+                |row| {
+                    Ok(StoredReviewCandidate {
+                        signature: row.get(0)?,
+                        verdict: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)
+    }
+
     /// # Errors
     ///
     /// Returns a redacted error when the event hash chain is invalid or cannot
@@ -191,6 +517,40 @@ impl ReceivableStore {
     }
 }
 
+fn migrate_state_constraint(connection: &Connection) -> Result<(), StoreError> {
+    let schema: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'receivables'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StoreError::Unavailable)?;
+    if !schema.contains("CHECK(state = 'open')") {
+        return Ok(());
+    }
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE receivables RENAME TO receivables_v1;
+             CREATE TABLE receivables (
+                 receivable_id TEXT PRIMARY KEY NOT NULL,
+                 recipient TEXT NOT NULL,
+                 mint TEXT NOT NULL,
+                 atomic_amount INTEGER NOT NULL,
+                 decimals INTEGER NOT NULL,
+                 reference TEXT NOT NULL UNIQUE,
+                 public_label TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN ('open','payment_verified','needs_review')),
+                 created_at_unix_ms INTEGER NOT NULL,
+                 solana_pay_url TEXT NOT NULL
+             );
+             INSERT INTO receivables SELECT * FROM receivables_v1;
+             DROP TABLE receivables_v1;
+             COMMIT;",
+        )
+        .map_err(|_| StoreError::Unavailable)
+}
+
 fn find_in(connection: &Connection, id: &str) -> Result<Option<StoredReceivable>, StoreError> {
     let raw = connection.query_row(
         "SELECT receivable_id,recipient,mint,atomic_amount,decimals,reference,public_label,state,created_at_unix_ms,solana_pay_url FROM receivables WHERE receivable_id = ?1", [id],
@@ -210,23 +570,39 @@ fn find_in(connection: &Connection, id: &str) -> Result<Option<StoredReceivable>
                 public_label: BoundedText::<MAX_PUBLIC_LABEL_BYTES>::new(label)
                     .map_err(|_| StoreError::Integrity)?,
             };
-            if state != "open"
-                || request
-                    .solana_pay_url()
-                    .map_err(|_| StoreError::Integrity)?
-                    != url
-            {
+            let state = match state.as_str() {
+                "open" => ReceivableState::Open,
+                "payment_verified" => ReceivableState::PaymentVerified,
+                "needs_review" => ReceivableState::NeedsReview,
+                _ => return Err(StoreError::Integrity),
+            };
+            let generated_url = request
+                .solana_pay_url()
+                .map_err(|_| StoreError::Integrity)?;
+            if !urls_equivalent(&generated_url, &url) {
                 return Err(StoreError::Integrity);
             }
             Ok(StoredReceivable {
                 request,
-                state: ReceivableState::Open,
+                state,
                 created_at_unix_ms: created,
                 solana_pay_url: url,
             })
         },
     )
     .transpose()
+}
+
+fn urls_equivalent(left: &str, right: &str) -> bool {
+    percent_encoding::percent_decode_str(left)
+        .decode_utf8()
+        .ok()
+        .zip(
+            percent_encoding::percent_decode_str(right)
+                .decode_utf8()
+                .ok(),
+        )
+        .is_some_and(|(left, right)| left == right)
 }
 
 fn same_terms(existing: &StoredReceivable, request: &PaymentRequest) -> bool {
@@ -246,6 +622,48 @@ fn canonical_creation_event(
     format!("schema_version={EVENT_SCHEMA_VERSION}\ndomain={EVENT_DOMAIN}\nevent=receivable_created\nprevious_event_hash={previous}\nreceivable_id={}\nstate=open\nrecipient={}\nmint={}\natomic_amount={}\ndecimals={}\nreference={}\npublic_label={}\ncreated_at_unix_ms={created_at_unix_ms}\n", request.receivable_id.as_str(), request.recipient.as_str(), request.mint.as_str(), request.amount.get(), request.decimals, request.reference.as_base58(), request.public_label.as_str()).into_bytes()
 }
 
+fn append_event(
+    transaction: &rusqlite::Transaction<'_>,
+    receivable_id: &ReceivableId,
+    event_fields: &[u8],
+) -> Result<(), StoreError> {
+    let previous: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT event_hash FROM receivable_events ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| StoreError::Unavailable)?;
+    let previous_text = previous
+        .as_deref()
+        .map_or_else(|| "GENESIS".to_owned(), hex);
+    let mut canonical = format!(
+        "schema_version={EVENT_SCHEMA_VERSION}\ndomain={EVENT_DOMAIN}\nprevious_event_hash={previous_text}\nreceivable_id={}\n",
+        receivable_id.as_str()
+    )
+    .into_bytes();
+    canonical.extend_from_slice(event_fields);
+    let event_hash = Sha256::digest(&canonical).to_vec();
+    transaction
+        .execute(
+            "INSERT INTO receivable_events (
+                receivable_id,event_schema_version,event_domain,previous_event_hash,
+                canonical_event_bytes,event_hash
+             ) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                receivable_id.as_str(),
+                EVENT_SCHEMA_VERSION,
+                EVENT_DOMAIN,
+                previous,
+                canonical,
+                event_hash
+            ],
+        )
+        .map_err(|_| StoreError::Unavailable)?;
+    Ok(())
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -257,6 +675,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use recebi_core::GenesisHash;
     use std::sync::Arc;
     use std::thread;
 
@@ -338,5 +757,176 @@ mod tests {
         let connection = Connection::open(&path).expect("connection");
         connection.execute_batch("DROP TRIGGER receivable_events_no_update; UPDATE receivable_events SET canonical_event_bytes = x'00';").expect("tamper");
         assert_eq!(store.verify_event_chain(), Err(StoreError::Integrity));
+    }
+
+    fn evidence(request: &PaymentRequest, signature_byte: u8) -> SettlementEvidence {
+        SettlementEvidence {
+            signature: bs58::encode([signature_byte; 64]).into_string(),
+            slot: 42,
+            block_time_unix: Some(1_700_000_000),
+            cluster_genesis_hash: GenesisHash::parse(
+                "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+            )
+            .expect("genesis"),
+            recipient: request.recipient.clone(),
+            mint: request.mint.clone(),
+            amount: request.amount,
+            transfer_instruction_position: 0,
+            fingerprint: format!("fingerprint-{signature_byte}"),
+        }
+    }
+
+    #[test]
+    fn settlement_is_atomic_idempotent_and_replay_protected_after_restart() {
+        let directory = tempfile::tempdir().expect("dir");
+        let path = directory.path().join("recebi.sqlite3");
+        let store = ReceivableStore::open(&path).expect("store");
+        let first = store
+            .create_or_get(request("SETTLED", 7), 100)
+            .expect("create");
+        let settled = evidence(&first.request, 9);
+        store
+            .mark_payment_verified(
+                &first.request.receivable_id,
+                &first.request.reference,
+                &settled,
+                200,
+            )
+            .expect("settle");
+
+        let reopened = ReceivableStore::open(&path).expect("restart");
+        reopened
+            .mark_payment_verified(
+                &first.request.receivable_id,
+                &first.request.reference,
+                &settled,
+                201,
+            )
+            .expect("idempotent");
+        assert_eq!(
+            reopened
+                .get(&first.request.receivable_id)
+                .expect("get")
+                .expect("record")
+                .state,
+            ReceivableState::PaymentVerified
+        );
+        assert_eq!(
+            reopened
+                .replay_state(&settled.signature, &first.request.reference)
+                .expect("replay state"),
+            (true, true)
+        );
+        assert_eq!(
+            reopened
+                .settlement_signature(&first.request.receivable_id)
+                .expect("signature"),
+            Some(settled.signature.clone())
+        );
+
+        let second = reopened
+            .create_or_get(request("REPLAY", 8), 300)
+            .expect("second");
+        assert_eq!(
+            reopened.mark_payment_verified(
+                &second.request.receivable_id,
+                &second.request.reference,
+                &settled,
+                301,
+            ),
+            Err(StoreError::Replay)
+        );
+        assert_eq!(
+            reopened
+                .get(&second.request.receivable_id)
+                .expect("get")
+                .expect("record")
+                .state,
+            ReceivableState::Open
+        );
+        reopened.verify_event_chain().expect("chain");
+    }
+
+    #[test]
+    fn reconciliation_lease_excludes_overlap_and_allows_expiry() {
+        let directory = tempfile::tempdir().expect("dir");
+        let store = ReceivableStore::open(directory.path().join("recebi.sqlite3")).expect("store");
+        store
+            .acquire_reconciliation_lease("owner-a", 100, 200)
+            .expect("first lease");
+        assert_eq!(
+            store.acquire_reconciliation_lease("owner-b", 150, 250),
+            Err(StoreError::ReconciliationBusy)
+        );
+        store
+            .acquire_reconciliation_lease("owner-b", 200, 300)
+            .expect("expired replacement");
+        store
+            .release_reconciliation_lease("owner-a")
+            .expect("non-owner release is harmless");
+        assert_eq!(
+            store.acquire_reconciliation_lease("owner-c", 250, 350),
+            Err(StoreError::ReconciliationBusy)
+        );
+        store
+            .release_reconciliation_lease("owner-b")
+            .expect("release");
+        store
+            .acquire_reconciliation_lease("owner-c", 250, 350)
+            .expect("lease after release");
+    }
+
+    #[test]
+    fn migrates_phase_two_rows_and_accepts_equivalent_encoded_urls() {
+        let directory = tempfile::tempdir().expect("dir");
+        let path = directory.path().join("recebi.sqlite3");
+        let original = request("MIGRATE", 7);
+        let generated = original.solana_pay_url().expect("url");
+        let legacy = percent_encoding::percent_decode_str(&generated)
+            .decode_utf8()
+            .expect("utf8")
+            .into_owned();
+        let connection = Connection::open(&path).expect("connection");
+        connection
+            .execute_batch(
+                "CREATE TABLE receivables (
+                    receivable_id TEXT PRIMARY KEY NOT NULL,
+                    recipient TEXT NOT NULL,
+                    mint TEXT NOT NULL,
+                    atomic_amount INTEGER NOT NULL,
+                    decimals INTEGER NOT NULL,
+                    reference TEXT NOT NULL UNIQUE,
+                    public_label TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state = 'open'),
+                    created_at_unix_ms INTEGER NOT NULL,
+                    solana_pay_url TEXT NOT NULL
+                );",
+            )
+            .expect("old schema");
+        connection
+            .execute(
+                "INSERT INTO receivables VALUES (?1,?2,?3,?4,?5,?6,?7,'open',?8,?9)",
+                params![
+                    original.receivable_id.as_str(),
+                    original.recipient.as_str(),
+                    original.mint.as_str(),
+                    i64::try_from(original.amount.get()).expect("amount"),
+                    i64::from(original.decimals),
+                    original.reference.as_base58(),
+                    original.public_label.as_str(),
+                    100_i64,
+                    legacy
+                ],
+            )
+            .expect("old row");
+        drop(connection);
+
+        let migrated = ReceivableStore::open(&path).expect("migrate");
+        let stored = migrated
+            .get(&original.receivable_id)
+            .expect("get")
+            .expect("row");
+        assert_eq!(stored.request, original);
+        assert!(urls_equivalent(&stored.solana_pay_url, &generated));
     }
 }

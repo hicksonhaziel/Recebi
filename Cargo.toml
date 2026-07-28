@@ -18,6 +18,7 @@ module_name_repetitions = "allow"
 
 [workspace.dependencies]
 bs58 = "0.5"
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 getrandom = "0.3"
 percent-encoding = "2.3"
@@ -36,4 +37,5 @@ tempfile = "3.14"
 thiserror = "2.0"
 toml = "0.9"
 url = { version = "2.5", features = ["serde"] }
+ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
 wincode = "=0.5.5"

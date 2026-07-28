@@ -105,7 +105,11 @@ fn map_store_error(error: &StoreError) -> CreateRequestError {
     match error {
         StoreError::IdempotencyConflict => CreateRequestError::IdempotencyConflict,
         StoreError::ReferenceReuse => CreateRequestError::ReferenceCollision,
-        StoreError::Unavailable | StoreError::Integrity => CreateRequestError::StorageUnavailable,
+        StoreError::Unavailable
+        | StoreError::Integrity
+        | StoreError::InvalidTransition
+        | StoreError::Replay
+        | StoreError::ReconciliationBusy => CreateRequestError::StorageUnavailable,
     }
 }
 

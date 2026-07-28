@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use recebi_core::PublicKey;
+use recebi_core::{GenesisHash, PublicKey};
 use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
@@ -18,6 +18,7 @@ pub struct AppConfig {
 #[derive(Clone, Deserialize)]
 pub struct TrustedConfig {
     pub cluster: Cluster,
+    pub genesis_hash: GenesisHash,
     pub merchant_wallet: PublicKey,
     pub accepted_mint: PublicKey,
     pub token_decimals: u8,
@@ -41,6 +42,7 @@ impl fmt::Debug for TrustedConfig {
         formatter
             .debug_struct("TrustedConfig")
             .field("cluster", &self.cluster)
+            .field("genesis_hash", &"[redacted]")
             .field("merchant_wallet", &"[redacted]")
             .field("accepted_mint", &"[redacted]")
             .field("token_decimals", &self.token_decimals)
@@ -163,6 +165,7 @@ mod tests {
     const VALID_CONFIG: &str = r#"
 [recebi]
 cluster = "devnet"
+genesis_hash = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
 merchant_wallet = "11111111111111111111111111111111"
 accepted_mint = "11111111111111111111111111111111"
 token_decimals = 6

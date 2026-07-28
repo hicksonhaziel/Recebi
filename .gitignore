@@ -5,6 +5,7 @@
 
 # Local Rust build output and Recebi runtime data.
 /target/
+**/node_modules/
 /recebi-data/
 *.db
 *.db-*

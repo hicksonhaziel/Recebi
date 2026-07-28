@@ -12,11 +12,13 @@ pub mod transaction_decode;
 
 pub use error::CoreError;
 pub use model::{
-    AtomicAmount, BoundedText, PaymentRequest, Provenance, PublicKey, ReceivableId,
+    AtomicAmount, BoundedText, GenesisHash, PaymentRequest, Provenance, PublicKey, ReceivableId,
     ReceivableState, Reference,
 };
 pub use settlement::{
     AccountMeta, CompiledInstruction, SettlementEvidence, SettlementExpectation, SettlementVerdict,
     TokenAccountSnapshot, TransactionSnapshot, verify_settlement, verify_settlement_once,
 };
-pub use transaction_decode::{RawTransaction, TransactionDecodeVerdict, decode_transaction};
+pub use transaction_decode::{
+    RawTokenAccount, RawTransaction, TransactionDecodeVerdict, decode_transaction,
+};

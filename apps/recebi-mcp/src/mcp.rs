@@ -6,6 +6,10 @@ use thiserror::Error;
 
 use crate::health::HealthService;
 use crate::receivable::{CreateRequestInput, ReceivableService};
+use crate::{
+    reconcile::{CheckInput, ReconcileOpenInput, ReconciliationService},
+    rpc::HttpSolanaRpc,
+};
 
 const MAX_MCP_INPUT_BYTES: usize = 16 * 1024;
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -16,7 +20,11 @@ pub enum McpError {
     Stdio,
 }
 
-pub fn serve(health: &HealthService, receivables: &ReceivableService) -> Result<(), McpError> {
+pub fn serve(
+    health: &HealthService,
+    receivables: &ReceivableService,
+    reconciliation: &ReconciliationService<HttpSolanaRpc>,
+) -> Result<(), McpError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     for line in stdin.lock().split(b'\n') {
@@ -33,7 +41,7 @@ pub fn serve(health: &HealthService, receivables: &ReceivableService) -> Result<
             let request = serde_json::from_slice(&line);
             Some(match request {
                 Ok(request) if is_notification(&request) => continue,
-                Ok(request) => dispatch(health, receivables, &request),
+                Ok(request) => dispatch(health, receivables, reconciliation, &request),
                 Err(_) => error_response(&Value::Null, -32700, "parse_error"),
             })
         };
@@ -55,7 +63,12 @@ fn is_notification(request: &Value) -> bool {
         && request.get("id").is_none()
 }
 
-fn dispatch(health: &HealthService, receivables: &ReceivableService, request: &Value) -> Value {
+fn dispatch(
+    health: &HealthService,
+    receivables: &ReceivableService,
+    reconciliation: &ReconciliationService<HttpSolanaRpc>,
+    request: &Value,
+) -> Value {
     let Some(object) = request.as_object() else {
         return error_response(&Value::Null, -32600, "invalid_request");
     };
@@ -76,9 +89,20 @@ fn dispatch(health: &HealthService, receivables: &ReceivableService, request: &V
         "ping" => success_response(&id, &json!({})),
         "tools/list" => success_response(
             &id,
-            &json!({"tools": [health_tool_schema(), create_request_tool_schema()]}),
+            &json!({"tools": [
+                health_tool_schema(),
+                create_request_tool_schema(),
+                check_tool_schema(),
+                reconcile_open_tool_schema()
+            ]}),
         ),
-        "tools/call" => call_tool(health, receivables, &id, object.get("params")),
+        "tools/call" => call_tool(
+            health,
+            receivables,
+            reconciliation,
+            &id,
+            object.get("params"),
+        ),
         _ => error_response(&id, -32601, "method_not_found"),
     }
 }
@@ -86,6 +110,7 @@ fn dispatch(health: &HealthService, receivables: &ReceivableService, request: &V
 fn call_tool(
     health: &HealthService,
     receivables: &ReceivableService,
+    reconciliation: &ReconciliationService<HttpSolanaRpc>,
     id: &Value,
     params: Option<&Value>,
 ) -> Value {
@@ -97,7 +122,65 @@ fn call_tool(
         Some("recebi_create_request") => {
             call_create_request(receivables, id, params.get("arguments"))
         }
+        Some("recebi_check") => call_check(reconciliation, id, params.get("arguments")),
+        Some("recebi_reconcile_open") => {
+            call_reconcile_open(reconciliation, id, params.get("arguments"))
+        }
         _ => error_response(id, -32602, "unknown_tool"),
+    }
+}
+
+fn call_check(
+    reconciliation: &ReconciliationService<HttpSolanaRpc>,
+    id: &Value,
+    arguments: Option<&Value>,
+) -> Value {
+    let Some(arguments) = arguments else {
+        return error_response(id, -32602, "invalid_check_arguments");
+    };
+    let Ok(input) = serde_json::from_value::<CheckInput>(arguments.clone()) else {
+        return error_response(id, -32602, "invalid_check_arguments");
+    };
+    tool_result(id, reconciliation.check(input))
+}
+
+fn call_reconcile_open(
+    reconciliation: &ReconciliationService<HttpSolanaRpc>,
+    id: &Value,
+    arguments: Option<&Value>,
+) -> Value {
+    let arguments = arguments.cloned().unwrap_or_else(|| json!({}));
+    let Ok(input) = serde_json::from_value::<ReconcileOpenInput>(arguments) else {
+        return error_response(id, -32602, "invalid_reconcile_open_arguments");
+    };
+    tool_result(id, reconciliation.reconcile_open(input))
+}
+
+fn tool_result<T: serde::Serialize, E: std::fmt::Display>(
+    id: &Value,
+    result: Result<T, E>,
+) -> Value {
+    match result {
+        Ok(result) => success_response(
+            id,
+            &json!({
+                "content": [{
+                    "type": "text",
+                    "text": serde_json::to_string(&result).expect("serializable tool result")
+                }],
+                "isError": false
+            }),
+        ),
+        Err(error) => success_response(
+            id,
+            &json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("{{\"status\":\"error\",\"reason\":\"{error}\"}}")
+                }],
+                "isError": true
+            }),
+        ),
     }
 }
 
@@ -175,6 +258,35 @@ fn create_request_tool_schema() -> Value {
     })
 }
 
+fn check_tool_schema() -> Value {
+    json!({
+        "name": "recebi_check",
+        "description": "Locate and deterministically verify finalized Solana settlement for one receivable. It never signs or submits.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "receivable_id": {"type": "string", "maxLength": 64}
+            },
+            "required": ["receivable_id"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn reconcile_open_tool_schema() -> Value {
+    json!({
+        "name": "recebi_reconcile_open",
+        "description": "Reconcile a bounded batch of open receivables using finalized Solana reads.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_count": {"type": "integer", "minimum": 1, "maximum": 10}
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
 fn success_response(id: &Value, result: &Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -202,15 +314,24 @@ mod tests {
     use serde_json::json;
 
     use super::{create_request_tool_schema, dispatch, encode_response, health_tool_schema};
-    use crate::{config::AppConfig, health::HealthService, receivable::ReceivableService};
+    use crate::{
+        config::AppConfig, health::HealthService, receivable::ReceivableService,
+        reconcile::ReconciliationService, rpc::HttpSolanaRpc,
+    };
 
-    fn services() -> (tempfile::TempDir, HealthService, ReceivableService) {
+    fn services() -> (
+        tempfile::TempDir,
+        HealthService,
+        ReceivableService,
+        ReconciliationService<HttpSolanaRpc>,
+    ) {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config_path = directory.path().join("recebi.toml");
         let config = format!(
             r#"
 [recebi]
 cluster = "devnet"
+genesis_hash = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
 merchant_wallet = "11111111111111111111111111111111"
 accepted_mint = "11111111111111111111111111111111"
 token_decimals = 6
@@ -224,8 +345,9 @@ max_open_reconcile = 10
         std::fs::write(&config_path, config).expect("write config");
         let config = AppConfig::load(&config_path).expect("load config");
         let health = HealthService::new(config.clone());
-        let receivables = ReceivableService::new(config).expect("receivables");
-        (directory, health, receivables)
+        let receivables = ReceivableService::new(config.clone()).expect("receivables");
+        let reconciliation = ReconciliationService::live(config).expect("reconciliation");
+        (directory, health, receivables, reconciliation)
     }
 
     #[test]
@@ -250,17 +372,23 @@ max_open_reconcile = 10
 
     #[test]
     fn malformed_envelope_is_rejected() {
-        let (_directory, health, receivables) = services();
-        let result = dispatch(&health, &receivables, &json!({"jsonrpc": "2.0", "id": 1}));
+        let (_directory, health, receivables, reconciliation) = services();
+        let result = dispatch(
+            &health,
+            &receivables,
+            &reconciliation,
+            &json!({"jsonrpc": "2.0", "id": 1}),
+        );
         assert_eq!(result["error"]["message"], "invalid_request");
     }
 
     #[test]
     fn health_rejects_configuration_override_arguments() {
-        let (_directory, health, receivables) = services();
+        let (_directory, health, receivables, reconciliation) = services();
         let result = dispatch(
             &health,
             &receivables,
+            &reconciliation,
             &json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {"name": "recebi_health", "arguments": {"rpc_url": "https://attacker.invalid"}},
@@ -274,10 +402,11 @@ max_open_reconcile = 10
 
     #[test]
     fn create_rejects_memo_and_configuration_override_input() {
-        let (_directory, health, receivables) = services();
+        let (_directory, health, receivables, reconciliation) = services();
         let result = dispatch(
             &health,
             &receivables,
+            &reconciliation,
             &json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {"name": "recebi_create_request", "arguments": {"receivable_id": "ACME-412", "amount": "0.1", "public_label": "ACME", "memo": "private", "rpc_url": "https://attacker.invalid"}},

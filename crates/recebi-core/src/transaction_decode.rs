@@ -8,7 +8,8 @@ use solana_message::{MessageHeader, VersionedMessage, v0};
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::{
-    AccountMeta, CompiledInstruction, PublicKey, TokenAccountSnapshot, TransactionSnapshot,
+    AccountMeta, CompiledInstruction, GenesisHash, PublicKey, TokenAccountSnapshot,
+    TransactionSnapshot,
 };
 
 /// Solana's maximum serialized transaction size. Keeping this check before the
@@ -25,12 +26,19 @@ pub struct RawTransaction {
     pub finalized: bool,
     pub succeeded: bool,
     /// The genesis hash observed from the configured RPC cluster.
-    pub cluster_genesis_hash: PublicKey,
+    pub cluster_genesis_hash: GenesisHash,
     /// v0 lookup addresses in the canonical RPC order: writable then readonly.
     pub loaded_writable_addresses: Vec<PublicKey>,
     pub loaded_readonly_addresses: Vec<PublicKey>,
-    /// Token-account mint facts from the same finalized transaction response.
-    pub token_accounts: Vec<TokenAccountSnapshot>,
+    /// Token-account mint facts by canonical combined account index from the
+    /// same finalized transaction response.
+    pub token_accounts: Vec<RawTokenAccount>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawTokenAccount {
+    pub account_index: u8,
+    pub mint: PublicKey,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,7 +77,7 @@ pub fn decode_transaction(
         .ok_or(TransactionDecodeVerdict::InvalidTransaction)?
         .to_string();
     let (account_keys, address_tables_resolved) = account_keys(&transaction.message, raw)?;
-    validate_token_accounts(&raw.token_accounts, &account_keys)?;
+    let token_accounts = token_accounts(&raw.token_accounts, &account_keys)?;
 
     Ok(TransactionSnapshot {
         signature,
@@ -90,7 +98,7 @@ pub fn decode_transaction(
                 data: instruction.data.clone(),
             })
             .collect(),
-        token_accounts: raw.token_accounts.clone(),
+        token_accounts,
     })
 }
 
@@ -187,19 +195,26 @@ fn static_account_keys(
         .collect()
 }
 
-fn validate_token_accounts(
-    token_accounts: &[TokenAccountSnapshot],
+fn token_accounts(
+    token_accounts: &[RawTokenAccount],
     account_keys: &[AccountMeta],
-) -> Result<(), TransactionDecodeVerdict> {
-    let known_addresses: HashSet<&PublicKey> = account_keys.iter().map(|meta| &meta.key).collect();
+) -> Result<Vec<TokenAccountSnapshot>, TransactionDecodeVerdict> {
     let mut seen = HashSet::new();
+    let mut output = Vec::with_capacity(token_accounts.len());
     for token_account in token_accounts {
-        if !known_addresses.contains(&token_account.address) || !seen.insert(&token_account.address)
-        {
+        let index = usize::from(token_account.account_index);
+        let Some(meta) = account_keys.get(index) else {
+            return Err(TransactionDecodeVerdict::InvalidTokenAccountMetadata);
+        };
+        if !seen.insert(token_account.account_index) {
             return Err(TransactionDecodeVerdict::InvalidTokenAccountMetadata);
         }
+        output.push(TokenAccountSnapshot {
+            address: meta.key.clone(),
+            mint: token_account.mint.clone(),
+        });
     }
-    Ok(())
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -280,23 +295,25 @@ mod tests {
                 block_time_unix: Some(1_700_000_000),
                 finalized: true,
                 succeeded: true,
-                cluster_genesis_hash: key("11111111111111111111111111111111"),
+                cluster_genesis_hash: GenesisHash::parse("11111111111111111111111111111111")
+                    .expect("genesis"),
                 loaded_writable_addresses: vec![],
                 loaded_readonly_addresses: vec![],
                 token_accounts: vec![
-                    TokenAccountSnapshot {
-                        address: source,
+                    RawTokenAccount {
+                        account_index: 1,
                         mint: mint.clone(),
                     },
-                    TokenAccountSnapshot {
-                        address: destination,
+                    RawTokenAccount {
+                        account_index: 2,
                         mint: mint.clone(),
                     },
                 ],
             },
             SettlementExpectation {
                 receivable_id: ReceivableId::new("ACME-412").expect("id"),
-                cluster_genesis_hash: key("11111111111111111111111111111111"),
+                cluster_genesis_hash: GenesisHash::parse("11111111111111111111111111111111")
+                    .expect("genesis"),
                 merchant_wallet: merchant,
                 mint,
                 amount,

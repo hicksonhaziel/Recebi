@@ -3,7 +3,9 @@ use std::{collections::HashSet, hash::BuildHasher};
 use sha2::{Digest, Sha256};
 use spl_token_interface::instruction::TokenInstruction;
 
-use crate::{AtomicAmount, PublicKey, ReceivableId, Reference, solana::derive_classic_ata};
+use crate::{
+    AtomicAmount, GenesisHash, PublicKey, ReceivableId, Reference, solana::derive_classic_ata,
+};
 
 const CLASSIC_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -39,7 +41,7 @@ pub struct TransactionSnapshot {
     pub block_time_unix: Option<i64>,
     pub finalized: bool,
     pub succeeded: bool,
-    pub cluster_genesis_hash: PublicKey,
+    pub cluster_genesis_hash: GenesisHash,
     pub address_tables_resolved: bool,
     pub account_keys: Vec<AccountMeta>,
     pub instructions: Vec<CompiledInstruction>,
@@ -49,7 +51,7 @@ pub struct TransactionSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettlementExpectation {
     pub receivable_id: ReceivableId,
-    pub cluster_genesis_hash: PublicKey,
+    pub cluster_genesis_hash: GenesisHash,
     pub merchant_wallet: PublicKey,
     pub mint: PublicKey,
     pub amount: AtomicAmount,
@@ -62,7 +64,7 @@ pub struct SettlementEvidence {
     pub signature: String,
     pub slot: u64,
     pub block_time_unix: Option<i64>,
-    pub cluster_genesis_hash: PublicKey,
+    pub cluster_genesis_hash: GenesisHash,
     pub recipient: PublicKey,
     pub mint: PublicKey,
     pub amount: AtomicAmount,
@@ -84,6 +86,7 @@ pub enum SettlementVerdict {
     WrongCluster,
     WrongDecimals,
     WrongRecipient,
+    SelfTransfer,
     WrongAmount,
     MissingReference,
     UnsafeReference,
@@ -238,6 +241,9 @@ fn decode_transfer(
     }
     let source = key(snapshot, ix.account_indices[0])?;
     let destination = key(snapshot, ix.account_indices[destination_position])?;
+    if source == destination {
+        return Err(SettlementVerdict::SelfTransfer);
+    }
     if destination != *merchant_ata {
         return Ok(Some((destination, AtomicAmount::new(amount), false)));
     }
@@ -331,7 +337,7 @@ mod tests {
             block_time_unix: Some(1_700_000_000),
             finalized: true,
             succeeded: true,
-            cluster_genesis_hash: PublicKey::parse("11111111111111111111111111111111")
+            cluster_genesis_hash: GenesisHash::parse("11111111111111111111111111111111")
                 .expect("genesis"),
             address_tables_resolved: true,
             account_keys: vec![
@@ -386,7 +392,7 @@ mod tests {
             snapshot,
             SettlementExpectation {
                 receivable_id: ReceivableId::new("ACME-412").expect("id"),
-                cluster_genesis_hash: PublicKey::parse("11111111111111111111111111111111")
+                cluster_genesis_hash: GenesisHash::parse("11111111111111111111111111111111")
                     .expect("genesis"),
                 merchant_wallet: merchant,
                 mint,
@@ -442,7 +448,7 @@ mod tests {
             Err(SettlementVerdict::WrongAmount)
         );
         let (mut snapshot, expected) = fixture();
-        snapshot.instructions[0].account_indices[2] = 1;
+        snapshot.instructions[0].account_indices[2] = 3;
         assert_eq!(
             verify_settlement(&snapshot, &expected),
             Err(SettlementVerdict::WrongRecipient)
@@ -455,10 +461,21 @@ mod tests {
         );
         let (mut snapshot, expected) = fixture();
         snapshot.cluster_genesis_hash =
-            PublicKey::parse("SysvarC1ock11111111111111111111111111111111").expect("cluster");
+            GenesisHash::parse("EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG").expect("cluster");
         assert_eq!(
             verify_settlement(&snapshot, &expected),
             Err(SettlementVerdict::WrongCluster)
+        );
+    }
+
+    #[test]
+    fn rejects_a_self_transfer_with_no_recipient_balance_effect() {
+        let (mut snapshot, expected) = fixture();
+        let destination = snapshot.account_keys[2].key.clone();
+        snapshot.account_keys[1].key = destination;
+        assert_eq!(
+            verify_settlement(&snapshot, &expected),
+            Err(SettlementVerdict::SelfTransfer)
         );
     }
 
@@ -585,7 +602,7 @@ mod tests {
 
         let (mut snapshot, expected) = fixture();
         let mut extra = snapshot.instructions[0].clone();
-        extra.account_indices[2] = 1;
+        extra.account_indices[2] = 3;
         snapshot.instructions.push(extra);
         assert_eq!(
             verify_settlement(&snapshot, &expected),
