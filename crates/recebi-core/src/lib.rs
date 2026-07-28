@@ -8,6 +8,7 @@ pub mod limits;
 pub mod model;
 pub mod settlement;
 pub mod solana;
+pub mod transaction_decode;
 
 pub use error::CoreError;
 pub use model::{
@@ -18,3 +19,4 @@ pub use settlement::{
     AccountMeta, CompiledInstruction, SettlementEvidence, SettlementExpectation, SettlementVerdict,
     TokenAccountSnapshot, TransactionSnapshot, verify_settlement, verify_settlement_once,
 };
+pub use transaction_decode::{RawTransaction, TransactionDecodeVerdict, decode_transaction};

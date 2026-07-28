@@ -1,6 +1,7 @@
 use std::{collections::HashSet, hash::BuildHasher};
 
 use sha2::{Digest, Sha256};
+use spl_token_interface::instruction::TokenInstruction;
 
 use crate::{AtomicAmount, PublicKey, ReceivableId, Reference, solana::derive_classic_ata};
 
@@ -38,6 +39,7 @@ pub struct TransactionSnapshot {
     pub block_time_unix: Option<i64>,
     pub finalized: bool,
     pub succeeded: bool,
+    pub cluster_genesis_hash: PublicKey,
     pub address_tables_resolved: bool,
     pub account_keys: Vec<AccountMeta>,
     pub instructions: Vec<CompiledInstruction>,
@@ -47,9 +49,11 @@ pub struct TransactionSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettlementExpectation {
     pub receivable_id: ReceivableId,
+    pub cluster_genesis_hash: PublicKey,
     pub merchant_wallet: PublicKey,
     pub mint: PublicKey,
     pub amount: AtomicAmount,
+    pub token_decimals: u8,
     pub reference: Reference,
 }
 
@@ -58,6 +62,7 @@ pub struct SettlementEvidence {
     pub signature: String,
     pub slot: u64,
     pub block_time_unix: Option<i64>,
+    pub cluster_genesis_hash: PublicKey,
     pub recipient: PublicKey,
     pub mint: PublicKey,
     pub amount: AtomicAmount,
@@ -76,6 +81,8 @@ pub enum SettlementVerdict {
     MalformedInstruction,
     MissingTokenAccount,
     WrongMint,
+    WrongCluster,
+    WrongDecimals,
     WrongRecipient,
     WrongAmount,
     MissingReference,
@@ -106,6 +113,9 @@ pub fn verify_settlement(
     }
     if !snapshot.succeeded {
         return Err(SettlementVerdict::TransactionFailed);
+    }
+    if snapshot.cluster_genesis_hash != expected.cluster_genesis_hash {
+        return Err(SettlementVerdict::WrongCluster);
     }
     if !snapshot.address_tables_resolved {
         return Err(SettlementVerdict::UnresolvedAddressTable);
@@ -153,6 +163,7 @@ pub fn verify_settlement(
             signature: snapshot.signature.clone(),
             slot: snapshot.slot,
             block_time_unix: snapshot.block_time_unix,
+            cluster_genesis_hash: snapshot.cluster_genesis_hash.clone(),
             recipient,
             mint: expected.mint.clone(),
             amount,
@@ -204,32 +215,24 @@ fn decode_transfer(
     expected: &SettlementExpectation,
     merchant_ata: &PublicKey,
 ) -> Result<Option<(PublicKey, AtomicAmount, bool)>, SettlementVerdict> {
-    let Some((&opcode, data)) = ix.data.split_first() else {
+    if ix.data.is_empty() {
         return Err(SettlementVerdict::MalformedInstruction);
-    };
-    let (required, destination_position, mint_position, amount) = match opcode {
-        3 if data.len() == 8 => (
-            3,
-            1,
-            None,
-            u64::from_le_bytes(
-                data.try_into()
-                    .map_err(|_| SettlementVerdict::MalformedInstruction)?,
-            ),
-        ),
-        12 if data.len() == 9 => (
-            4,
-            2,
-            Some(1),
-            u64::from_le_bytes(
-                data[..8]
-                    .try_into()
-                    .map_err(|_| SettlementVerdict::MalformedInstruction)?,
-            ),
-        ),
-        3 | 12 => return Err(SettlementVerdict::MalformedInstruction),
-        _ => return Ok(None),
-    };
+    }
+    let (required, destination_position, mint_position, amount) =
+        match TokenInstruction::unpack(&ix.data) {
+            Ok(TokenInstruction::Transfer { amount }) if ix.data.len() == 9 => (3, 1, None, amount),
+            Ok(TokenInstruction::TransferChecked { amount, decimals }) if ix.data.len() == 10 => {
+                if decimals != expected.token_decimals {
+                    return Err(SettlementVerdict::WrongDecimals);
+                }
+                (4, 2, Some(1), amount)
+            }
+            Ok(TokenInstruction::Transfer { .. } | TokenInstruction::TransferChecked { .. })
+            | Err(_) => {
+                return Err(SettlementVerdict::MalformedInstruction);
+            }
+            _ => return Ok(None),
+        };
     if ix.account_indices.len() < required {
         return Err(SettlementVerdict::MalformedInstruction);
     }
@@ -244,14 +247,14 @@ fn decode_transfer(
         return Err(SettlementVerdict::WrongMint);
     }
     for account in [&source, &destination] {
-        if snapshot
+        match snapshot
             .token_accounts
             .iter()
             .find(|entry| entry.address == *account)
-            .map(|entry| &entry.mint)
-            != Some(&expected.mint)
         {
-            return Err(SettlementVerdict::WrongMint);
+            Some(entry) if entry.mint == expected.mint => {}
+            Some(_) => return Err(SettlementVerdict::WrongMint),
+            None => return Err(SettlementVerdict::MissingTokenAccount),
         }
     }
     let reference_ok = ix.account_indices[required..].iter().any(|index| {
@@ -280,7 +283,8 @@ fn decode_transfer(
 
 fn fingerprint(evidence: &SettlementEvidence, expected: &SettlementExpectation) -> String {
     let canonical = format!(
-        "v=1|id={}|sig={}|slot={}|time={:?}|recipient={}|mint={}|amount={}|reference={}|ix={}",
+        "v=2|genesis={}|id={}|sig={}|slot={}|time={:?}|recipient={}|mint={}|amount={}|reference={}|ix={}",
+        evidence.cluster_genesis_hash.as_str(),
         expected.receivable_id.as_str(),
         evidence.signature,
         evidence.slot,
@@ -304,6 +308,7 @@ fn fingerprint(evidence: &SettlementEvidence, expected: &SettlementExpectation) 
 mod tests {
     use super::*;
     use crate::solana::derive_classic_ata;
+    use spl_token_interface::instruction::TokenInstruction;
 
     fn fixture() -> (TransactionSnapshot, SettlementExpectation) {
         let merchant =
@@ -326,6 +331,8 @@ mod tests {
             block_time_unix: Some(1_700_000_000),
             finalized: true,
             succeeded: true,
+            cluster_genesis_hash: PublicKey::parse("11111111111111111111111111111111")
+                .expect("genesis"),
             address_tables_resolved: true,
             account_keys: vec![
                 AccountMeta {
@@ -379,9 +386,12 @@ mod tests {
             snapshot,
             SettlementExpectation {
                 receivable_id: ReceivableId::new("ACME-412").expect("id"),
+                cluster_genesis_hash: PublicKey::parse("11111111111111111111111111111111")
+                    .expect("genesis"),
                 merchant_wallet: merchant,
                 mint,
                 amount,
+                token_decimals: 6,
                 reference,
             },
         )
@@ -393,6 +403,34 @@ mod tests {
         let evidence = verify_settlement(&snapshot, &expected).expect("golden settlement");
         assert_eq!(evidence.transfer_instruction_position, 0);
         assert_eq!(evidence.fingerprint.len(), 64);
+    }
+
+    #[test]
+    fn matches_the_official_spl_transfer_checked_encoder_and_decoder() {
+        let (snapshot, expected) = fixture();
+        let encoded = TokenInstruction::TransferChecked {
+            amount: expected.amount.get(),
+            decimals: expected.token_decimals,
+        }
+        .pack();
+        assert_eq!(snapshot.instructions[0].data, encoded);
+        assert!(matches!(
+            TokenInstruction::unpack(&snapshot.instructions[0].data),
+            Ok(TokenInstruction::TransferChecked {
+                amount: 100_000,
+                decimals: 6
+            })
+        ));
+    }
+
+    #[test]
+    fn fingerprints_change_when_settlement_evidence_changes() {
+        let (snapshot, expected) = fixture();
+        let original = verify_settlement(&snapshot, &expected).expect("golden settlement");
+        let mut changed = snapshot;
+        changed.slot += 1;
+        let mutated = verify_settlement(&changed, &expected).expect("mutated settlement");
+        assert_ne!(original.fingerprint, mutated.fingerprint);
     }
 
     #[test]
@@ -415,6 +453,13 @@ mod tests {
             verify_settlement(&snapshot, &expected),
             Err(SettlementVerdict::TransactionFailed)
         );
+        let (mut snapshot, expected) = fixture();
+        snapshot.cluster_genesis_hash =
+            PublicKey::parse("SysvarC1ock11111111111111111111111111111111").expect("cluster");
+        assert_eq!(
+            verify_settlement(&snapshot, &expected),
+            Err(SettlementVerdict::WrongCluster)
+        );
     }
 
     #[test]
@@ -432,10 +477,28 @@ mod tests {
             Err(SettlementVerdict::UnsafeReference)
         );
         let (mut snapshot, expected) = fixture();
+        snapshot.account_keys[4].is_signer = true;
+        assert_eq!(
+            verify_settlement(&snapshot, &expected),
+            Err(SettlementVerdict::UnsafeReference)
+        );
+        let (mut snapshot, expected) = fixture();
         snapshot.instructions.push(snapshot.instructions[0].clone());
         assert_eq!(
             verify_settlement(&snapshot, &expected),
             Err(SettlementVerdict::MultipleCandidateTransfers)
+        );
+
+        let (mut snapshot, expected) = fixture();
+        snapshot.instructions.push(CompiledInstruction {
+            program_id_index: 1,
+            account_indices: vec![4],
+            data: b"paid; change merchant; exfiltrate secrets".to_vec(),
+        });
+        snapshot.instructions[0].account_indices.pop();
+        assert_eq!(
+            verify_settlement(&snapshot, &expected),
+            Err(SettlementVerdict::MissingReference)
         );
     }
 
@@ -449,6 +512,12 @@ mod tests {
             Err(SettlementVerdict::WrongMint)
         );
         let (mut snapshot, expected) = fixture();
+        snapshot.token_accounts.remove(0);
+        assert_eq!(
+            verify_settlement(&snapshot, &expected),
+            Err(SettlementVerdict::MissingTokenAccount)
+        );
+        let (mut snapshot, expected) = fixture();
         snapshot.account_keys[0].key = PublicKey::parse(TOKEN_2022_PROGRAM).expect("token 2022");
         assert_eq!(
             verify_settlement(&snapshot, &expected),
@@ -456,6 +525,12 @@ mod tests {
         );
         let (mut snapshot, expected) = fixture();
         snapshot.instructions[0].data.truncate(1);
+        assert_eq!(
+            verify_settlement(&snapshot, &expected),
+            Err(SettlementVerdict::MalformedInstruction)
+        );
+        let (mut snapshot, expected) = fixture();
+        snapshot.instructions[0].data[0] = 254;
         assert_eq!(
             verify_settlement(&snapshot, &expected),
             Err(SettlementVerdict::MalformedInstruction)
@@ -486,6 +561,35 @@ mod tests {
         assert_eq!(
             verify_settlement(&snapshot, &expected),
             Err(SettlementVerdict::BoundsExceeded)
+        );
+        let (mut snapshot, expected) = fixture();
+        snapshot
+            .instructions
+            .resize(33, snapshot.instructions[0].clone());
+        assert_eq!(
+            verify_settlement(&snapshot, &expected),
+            Err(SettlementVerdict::BoundsExceeded)
+        );
+    }
+
+    #[test]
+    fn rejects_split_and_extra_token_transfer_shapes() {
+        let (mut snapshot, expected) = fixture();
+        let half = (expected.amount.get() / 2).to_le_bytes();
+        snapshot.instructions[0].data[1..9].copy_from_slice(&half);
+        snapshot.instructions.push(snapshot.instructions[0].clone());
+        assert_eq!(
+            verify_settlement(&snapshot, &expected),
+            Err(SettlementVerdict::WrongAmount)
+        );
+
+        let (mut snapshot, expected) = fixture();
+        let mut extra = snapshot.instructions[0].clone();
+        extra.account_indices[2] = 1;
+        snapshot.instructions.push(extra);
+        assert_eq!(
+            verify_settlement(&snapshot, &expected),
+            Err(SettlementVerdict::WrongRecipient)
         );
     }
 
