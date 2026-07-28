@@ -5,7 +5,7 @@ Brazil. The agent may explain and report a deterministic system's result; it
 must not decide what was paid, set a financial value, sign, submit, or refund a
 transaction.
 
-## Phase 4 status
+## Phase 5 status
 
 Recebi creates durable reference-bound USDC requests and independently
 reconciles them against finalized Solana transactions. It contains:
@@ -15,9 +15,11 @@ reconciles them against finalized Solana transactions. It contains:
   fingerprints, provenance, and receivable states.
 - `recebi-store`: local SQLite persistence with migrations, append-only events,
   SHA-256 hash chaining, atomic settlement/review transitions, replay
-  protection, and a singleton reconciliation lease.
+  protection, immutable PTAX evidence/month closes, and a singleton
+  reconciliation lease.
 - `recebi-mcp`: a stdio MCP server with `recebi_health`,
-  `recebi_create_request`, `recebi_check`, and `recebi_reconcile_open`.
+  `recebi_create_request`, `recebi_check`, `recebi_reconcile_open`, and
+  `recebi_close_month`.
 
 `recebi_create_request` accepts only a receivable ID, positive decimal amount,
 and public wallet-display label. It derives recipient, mint, decimals, and
@@ -31,8 +33,21 @@ merchant's derived token account. A mismatch remains unpaid in
 `needs_review`. Exact settlement consumes its signature and reference and is
 recorded once.
 
-Recebi still intentionally contains no PTAX valuation, transaction
-construction, signing, broadcasting, refund, or wallet-key handling.
+For verified payments, monthly close requests the pinned official BCB
+`CotacaoDolarDia` endpoint over bounded HTTPS. The strict policy accepts one
+same-day closing quote, hashes the exact response bytes, and never substitutes
+a weekend, holiday, future, or nearest-day value. Its BRL figure is explicitly
+a nominal reference using `1 USDC = 1 USD`, PTAX sale, integer arithmetic, and
+half-up cent rounding—not a claim of USDC fair value. A source failure leaves
+the payment verified and the valuation pending.
+
+Monthly close writes canonical JSON evidence, an accountant-oriented CSV, and
+a hash manifest under the trusted data directory. CSV is presentation only,
+not canonical state. These artifacts are accountant-ready evidence that may
+assist record keeping; they are not tax or legal advice.
+
+Recebi intentionally contains no transaction construction, signing,
+broadcasting, refund, or wallet-key handling.
 
 ## Local build
 
@@ -68,8 +83,10 @@ ZeroClaw configuration. Attach the `recebi` bundle only to the intended agent.
 
 `recebi_health` returns configuration and local-directory availability.
 Creation does not contact an RPC endpoint. `recebi_check` reconciles one ID;
-`recebi_reconcile_open` checks a configured bounded batch. Neither tool has a
-financial write capability.
+`recebi_reconcile_open` checks a configured bounded batch.
+`recebi_close_month` accepts only `YYYY-MM`, performs bounded official PTAX
+reads for verified records, and writes deterministic local evidence artifacts.
+None of these tools has a financial write capability.
 
 The repository includes an installable operator prompt at
 [zeroclaw/skills/recebi/SKILL.md](zeroclaw/skills/recebi/SKILL.md). It is

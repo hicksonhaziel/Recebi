@@ -22,6 +22,7 @@ url.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 solana-message.workspace = true
 solana-signature.workspace = true
 solana-transaction.workspace = true

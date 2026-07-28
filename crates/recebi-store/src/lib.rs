@@ -5,10 +5,12 @@ use std::{
 };
 
 use recebi_core::{
-    AtomicAmount, BoundedText, PaymentRequest, PublicKey, ReceivableId, ReceivableState, Reference,
-    SettlementEvidence, limits::MAX_PUBLIC_LABEL_BYTES,
+    AtomicAmount, BoundedText, PaymentRequest, PtaxDate, PtaxEvidence, PublicKey, ReceivableId,
+    ReceivableState, Reference, SettlementEvidence, UsdValuationMethod,
+    limits::{MAX_MONTH_EXPORT_ROWS, MAX_PUBLIC_LABEL_BYTES},
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -47,6 +49,31 @@ pub struct StoredReviewCandidate {
     pub verdict: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StoredValuation {
+    pub evidence: PtaxEvidence,
+    pub valuation_method: UsdValuationMethod,
+    pub brl_reference_cents: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredSettledReceivable {
+    pub receivable: StoredReceivable,
+    pub signature: String,
+    pub slot: u64,
+    pub block_time_unix: i64,
+    pub settlement_fingerprint: String,
+    pub valuation: Option<StoredValuation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredMonthClose {
+    pub month: String,
+    pub canonical_json: Vec<u8>,
+    pub accountant_csv: Vec<u8>,
+    pub manifest_json: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ReceivableStore {
     path: PathBuf,
@@ -56,6 +83,7 @@ impl ReceivableStore {
     /// # Errors
     ///
     /// Initializes the local schema or returns a redacted storage error.
+    #[allow(clippy::too_many_lines)] // The explicit SQLite schema is kept together for auditability.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let store = Self {
             path: path.as_ref().to_path_buf(),
@@ -113,8 +141,52 @@ impl ReceivableStore {
                  owner TEXT NOT NULL,
                  expires_at_unix_ms INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS valuations (
+                 receivable_id TEXT PRIMARY KEY NOT NULL,
+                 operation_date TEXT NOT NULL,
+                 quote_date TEXT NOT NULL,
+                 purchase TEXT NOT NULL,
+                 sale TEXT NOT NULL,
+                 bulletin_type TEXT,
+                 bulletin_timestamp TEXT NOT NULL,
+                 retrieved_at_unix_ms INTEGER NOT NULL,
+                 response_sha256 TEXT NOT NULL,
+                 source_id TEXT NOT NULL,
+                 policy_version TEXT NOT NULL,
+                 valuation_method_json TEXT NOT NULL,
+                 brl_reference_cents INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS month_closes (
+                 month TEXT PRIMARY KEY NOT NULL,
+                 canonical_json BLOB NOT NULL,
+                 accountant_csv BLOB NOT NULL,
+                 manifest_json BLOB NOT NULL,
+                 close_hash BLOB NOT NULL UNIQUE
+             );
+             CREATE TABLE IF NOT EXISTS month_close_revisions (
+                 month TEXT NOT NULL,
+                 revision INTEGER NOT NULL,
+                 canonical_json BLOB NOT NULL,
+                 accountant_csv BLOB NOT NULL,
+                 manifest_json BLOB NOT NULL,
+                 close_hash BLOB NOT NULL UNIQUE,
+                 PRIMARY KEY(month,revision)
+             );
+             CREATE TRIGGER IF NOT EXISTS valuations_no_update BEFORE UPDATE ON valuations BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS valuations_no_delete BEFORE DELETE ON valuations BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS month_closes_no_update BEFORE UPDATE ON month_closes BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS month_closes_no_delete BEFORE DELETE ON month_closes BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS month_close_revisions_no_update BEFORE UPDATE ON month_close_revisions BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS month_close_revisions_no_delete BEFORE DELETE ON month_close_revisions BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             INSERT OR IGNORE INTO month_close_revisions (
+                 month,revision,canonical_json,accountant_csv,manifest_json,close_hash
+             )
+             SELECT month,1,canonical_json,accountant_csv,manifest_json,close_hash
+             FROM month_closes;
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);
+             INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
+             INSERT OR IGNORE INTO schema_migrations(version) VALUES (4);
              COMMIT;",
         ).map_err(|_| StoreError::Unavailable)?;
         migrate_state_constraint(&connection)?;
@@ -487,6 +559,220 @@ impl ReceivableStore {
             .map_err(|_| StoreError::Unavailable)
     }
 
+    /// Attaches immutable valuation evidence to an already verified payment.
+    ///
+    /// # Errors
+    ///
+    /// The exact same retry is idempotent. Conflicts, unverified payments, and
+    /// storage failures fail closed.
+    pub fn attach_valuation(
+        &self,
+        receivable_id: &ReceivableId,
+        valuation: &StoredValuation,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Unavailable)?;
+        let state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM receivables WHERE receivable_id = ?1",
+                [receivable_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?;
+        if state.as_deref() != Some("payment_verified") {
+            return Err(StoreError::InvalidTransition);
+        }
+        let encoded_method = serde_json::to_string(&valuation.valuation_method)
+            .map_err(|_| StoreError::Unavailable)?;
+        let existing: Option<(String, String, i64)> = transaction
+            .query_row(
+                "SELECT response_sha256,valuation_method_json,brl_reference_cents
+                 FROM valuations WHERE receivable_id = ?1",
+                [receivable_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?;
+        if let Some((hash, method, cents)) = existing {
+            return if hash == valuation.evidence.response_sha256
+                && method == encoded_method
+                && u64::try_from(cents).ok() == Some(valuation.brl_reference_cents)
+            {
+                transaction.commit().map_err(|_| StoreError::Unavailable)
+            } else {
+                Err(StoreError::InvalidTransition)
+            };
+        }
+        transaction
+            .execute(
+                "INSERT INTO valuations (
+                    receivable_id,operation_date,quote_date,purchase,sale,bulletin_type,
+                    bulletin_timestamp,retrieved_at_unix_ms,response_sha256,source_id,
+                    policy_version,valuation_method_json,brl_reference_cents
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    receivable_id.as_str(),
+                    valuation.evidence.operation_date.as_str(),
+                    valuation.evidence.quote_date.as_str(),
+                    valuation.evidence.purchase,
+                    valuation.evidence.sale,
+                    valuation.evidence.bulletin_type,
+                    valuation.evidence.bulletin_timestamp,
+                    valuation.evidence.retrieved_at_unix_ms,
+                    valuation.evidence.response_sha256,
+                    valuation.evidence.source_id,
+                    valuation.evidence.policy_version,
+                    encoded_method,
+                    i64::try_from(valuation.brl_reference_cents)
+                        .map_err(|_| StoreError::Unavailable)?
+                ],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        append_event(
+            &transaction,
+            receivable_id,
+            format!(
+                "event=valuation_attached\noperation_date={}\nquote_date={}\nresponse_sha256={}\nbrl_reference_cents={}\n",
+                valuation.evidence.operation_date.as_str(),
+                valuation.evidence.quote_date.as_str(),
+                valuation.evidence.response_sha256,
+                valuation.brl_reference_cents
+            )
+            .as_bytes(),
+        )?;
+        transaction.commit().map_err(|_| StoreError::Unavailable)
+    }
+
+    /// Returns verified settlements in a UTC half-open interval.
+    ///
+    /// # Errors
+    ///
+    /// Missing block time, malformed durable evidence, row overflow, or
+    /// storage failure fails closed.
+    pub fn list_settled_between(
+        &self,
+        start_unix: i64,
+        end_unix: i64,
+    ) -> Result<Vec<StoredSettledReceivable>, StoreError> {
+        self.verify_event_chain()?;
+        let connection = self.connection()?;
+        let invalid_verified_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM receivables r LEFT JOIN settlements s USING(receivable_id)
+                 WHERE r.state = 'payment_verified'
+                   AND (s.receivable_id IS NULL OR s.block_time_unix IS NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        if invalid_verified_rows != 0 {
+            return Err(StoreError::Integrity);
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT r.receivable_id,s.signature,s.slot,s.block_time_unix,s.fingerprint
+                 FROM receivables r JOIN settlements s USING(receivable_id)
+                 WHERE s.block_time_unix >= ?1 AND s.block_time_unix < ?2
+                 ORDER BY s.block_time_unix,r.receivable_id LIMIT ?3",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        let rows = statement
+            .query_map(
+                params![
+                    start_unix,
+                    end_unix,
+                    i64::try_from(MAX_MONTH_EXPORT_ROWS + 1)
+                        .map_err(|_| StoreError::Unavailable)?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .map_err(|_| StoreError::Unavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::Unavailable)?;
+        if rows.len() > MAX_MONTH_EXPORT_ROWS {
+            return Err(StoreError::Integrity);
+        }
+        rows.into_iter()
+            .map(|(id, signature, slot, block_time, fingerprint)| {
+                let receivable = find_in(&connection, &id)?.ok_or(StoreError::Integrity)?;
+                let valuation = find_valuation_in(&connection, &id)?;
+                Ok(StoredSettledReceivable {
+                    receivable,
+                    signature,
+                    slot: u64::try_from(slot).map_err(|_| StoreError::Integrity)?,
+                    block_time_unix: block_time.ok_or(StoreError::Integrity)?,
+                    settlement_fingerprint: fingerprint,
+                    valuation,
+                })
+            })
+            .collect()
+    }
+
+    /// Persists immutable deterministic close revisions for a month.
+    ///
+    /// # Errors
+    ///
+    /// Same-byte retries are idempotent. A changed snapshot appends a revision,
+    /// preserving all earlier close bytes.
+    pub fn record_month_close(
+        &self,
+        close: StoredMonthClose,
+    ) -> Result<StoredMonthClose, StoreError> {
+        self.verify_event_chain()?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Unavailable)?;
+        if let Some(existing) = find_month_close_in(&transaction, &close.month)?
+            && existing == close
+        {
+            transaction.commit().map_err(|_| StoreError::Unavailable)?;
+            return Ok(existing);
+        }
+        let mut hash_input = close.month.as_bytes().to_vec();
+        hash_input.extend_from_slice(&close.canonical_json);
+        hash_input.extend_from_slice(&close.accountant_csv);
+        hash_input.extend_from_slice(&close.manifest_json);
+        let hash = Sha256::digest(&hash_input).to_vec();
+        let next_revision: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(revision),0) + 1 FROM month_close_revisions
+                 WHERE month = ?1",
+                [&close.month],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO month_close_revisions (
+                    month,revision,canonical_json,accountant_csv,manifest_json,close_hash
+                 ) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    close.month,
+                    next_revision,
+                    close.canonical_json,
+                    close.accountant_csv,
+                    close.manifest_json,
+                    hash
+                ],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        transaction.commit().map_err(|_| StoreError::Unavailable)?;
+        Ok(close)
+    }
+
     /// # Errors
     ///
     /// Returns a redacted error when the event hash chain is invalid or cannot
@@ -515,6 +801,97 @@ impl ReceivableStore {
         }
         Ok(())
     }
+}
+
+fn find_valuation_in(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<StoredValuation>, StoreError> {
+    let raw = connection
+        .query_row(
+            "SELECT operation_date,quote_date,purchase,sale,bulletin_type,
+                    bulletin_timestamp,retrieved_at_unix_ms,response_sha256,source_id,
+                    policy_version,valuation_method_json,brl_reference_cents
+             FROM valuations WHERE receivable_id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| StoreError::Unavailable)?;
+    raw.map(
+        |(
+            operation_date,
+            quote_date,
+            purchase,
+            sale,
+            bulletin_type,
+            bulletin_timestamp,
+            retrieved_at,
+            response_sha256,
+            source_id,
+            policy_version,
+            method,
+            cents,
+        )| {
+            Ok(StoredValuation {
+                evidence: PtaxEvidence {
+                    operation_date: PtaxDate::parse(operation_date)
+                        .map_err(|_| StoreError::Integrity)?,
+                    quote_date: PtaxDate::parse(quote_date).map_err(|_| StoreError::Integrity)?,
+                    purchase,
+                    sale,
+                    bulletin_type,
+                    bulletin_timestamp,
+                    retrieved_at_unix_ms: retrieved_at,
+                    response_sha256,
+                    source_id,
+                    policy_version,
+                },
+                valuation_method: serde_json::from_str(&method)
+                    .map_err(|_| StoreError::Integrity)?,
+                brl_reference_cents: u64::try_from(cents).map_err(|_| StoreError::Integrity)?,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn find_month_close_in(
+    connection: &Connection,
+    month: &str,
+) -> Result<Option<StoredMonthClose>, StoreError> {
+    connection
+        .query_row(
+            "SELECT canonical_json,accountant_csv,manifest_json
+             FROM month_close_revisions WHERE month = ?1
+             ORDER BY revision DESC LIMIT 1",
+            [month],
+            |row| {
+                Ok(StoredMonthClose {
+                    month: month.to_owned(),
+                    canonical_json: row.get(0)?,
+                    accountant_csv: row.get(1)?,
+                    manifest_json: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|_| StoreError::Unavailable)
 }
 
 fn migrate_state_constraint(connection: &Connection) -> Result<(), StoreError> {
@@ -845,6 +1222,29 @@ mod tests {
             ReceivableState::Open
         );
         reopened.verify_event_chain().expect("chain");
+    }
+
+    #[test]
+    fn monthly_snapshot_fails_closed_when_verified_settlement_has_no_operation_date() {
+        let directory = tempfile::tempdir().expect("dir");
+        let store = ReceivableStore::open(directory.path().join("recebi.sqlite3")).expect("store");
+        let stored = store
+            .create_or_get(request("NO-DATE", 7), 100)
+            .expect("create");
+        let mut settlement = evidence(&stored.request, 9);
+        settlement.block_time_unix = None;
+        store
+            .mark_payment_verified(
+                &stored.request.receivable_id,
+                &stored.request.reference,
+                &settlement,
+                200,
+            )
+            .expect("settle");
+        assert_eq!(
+            store.list_settled_between(0, i64::MAX),
+            Err(StoreError::Integrity)
+        );
     }
 
     #[test]

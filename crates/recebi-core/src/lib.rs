@@ -6,6 +6,7 @@
 pub mod error;
 pub mod limits;
 pub mod model;
+pub mod ptax;
 pub mod settlement;
 pub mod solana;
 pub mod transaction_decode;
@@ -14,6 +15,10 @@ pub use error::CoreError;
 pub use model::{
     AtomicAmount, BoundedText, GenesisHash, PaymentRequest, Provenance, PublicKey, ReceivableId,
     ReceivableState, Reference,
+};
+pub use ptax::{
+    PtaxDate, PtaxDecimal, PtaxEvidence, PtaxQuoteCandidate, UsdValuationMethod,
+    brl_reference_cents, select_strict_same_day_quote,
 };
 pub use settlement::{
     AccountMeta, CompiledInstruction, SettlementEvidence, SettlementExpectation, SettlementVerdict,

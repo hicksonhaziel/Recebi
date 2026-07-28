@@ -7,7 +7,7 @@ name = "recebi"
 transport = "stdio"
 command = "/absolute/path/to/recebi-mcp"
 args = ["--config", "/absolute/path/to/recebi.toml"]
-tool_timeout_secs = 5
+tool_timeout_secs = 180
 
 [mcp_bundles.recebi]
 servers = ["recebi"]

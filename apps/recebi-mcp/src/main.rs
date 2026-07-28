@@ -1,12 +1,16 @@
+mod close_month;
 mod config;
 mod health;
 mod mcp;
+mod ptax;
 mod receivable;
 mod reconcile;
 mod rpc;
 
 use clap::Parser;
+use close_month::CloseMonthService;
 use config::AppConfig;
+use ptax::HttpBcbPtax;
 
 #[derive(Debug, Parser)]
 #[command(name = "recebi-mcp", version, about = "Recebi local stdio MCP server")]
@@ -33,14 +37,28 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let reconciliation = match reconcile::ReconciliationService::live(config) {
+    let reconciliation = match reconcile::ReconciliationService::live(config.clone()) {
         Ok(service) => service,
         Err(error) => {
             eprintln!("recebi-mcp reconciliation error: {error}");
             std::process::exit(2);
         }
     };
-    if let Err(error) = mcp::serve(&health, &receivables, &reconciliation) {
+    let ptax = match HttpBcbPtax::new() {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("recebi-mcp PTAX configuration error: {error}");
+            std::process::exit(2);
+        }
+    };
+    let closing = match CloseMonthService::new(&config, ptax) {
+        Ok(service) => service,
+        Err(error) => {
+            eprintln!("recebi-mcp monthly close error: {error}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(error) = mcp::serve(&health, &receivables, &reconciliation, &closing) {
         eprintln!("recebi-mcp server error: {error}");
         std::process::exit(3);
     }

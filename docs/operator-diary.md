@@ -70,3 +70,29 @@ are labelled honestly; they are not represented as client or mainnet usage.
 - The exact reply included `payment_verified` and the complete signature. The
   adversarial reply said the receivable remains unpaid, needs review, and gave
   only `wrong_amount`.
+
+## 2026-07-28 — official PTAX evidence and July close
+
+- The locally built release closed UTC settlement month `2026-07` against the
+  existing verified devnet receipt. No signing or wallet key was involved.
+- Initial bounded BCB lookups encountered transient DNS timeouts. Recebi kept
+  `PHASE4-EXACT-002` payment-verified and produced an honest
+  `valuation_pending` close; it did not substitute another date or rate.
+- A later operator retry reached the pinned official BCB
+  `CotacaoDolarDia` endpoint. The strict same-day policy accepted exactly one
+  quote for operation date `2026-07-28`: purchase `5.11710`, sale `5.11770`,
+  bulletin timestamp `2026-07-28 13:25:31.150278`, and exact response SHA-256
+  `3ca1a5079993b3484c85e8010b573fc41444bae25b1880dabe43f002af095e6f`.
+- The evidence explicitly records the nominal `1 USDC = 1 USD` assumption.
+  Integer half-up rounding produced a BRL reference of `0.51` for `0.10` USDC.
+  This is not represented as USDC fair-value proof, tax advice, or legal
+  acceptance.
+- SQLite preserves both close revisions append-only: revision 1 records the
+  source-outage/pending result and revision 2 records the later BCB evidence.
+  Repeating identical closes is byte-idempotent.
+- The current canonical JSON, presentation CSV, and manifest hashes were
+  independently recomputed with `sha256sum` and matched the tool:
+  `49b4e1e322ec356c3c46fdc609112024057ffb044cf8cbb1524c9da0cb51f120`,
+  `d8c966bcb04f6b05188cf3ee913029438e114f8c4d2271e220455706b5a418ae`,
+  and
+  `cef5607686de502a990d68fe8252acfd56702eba75d5f73608163b5dc897df32`.

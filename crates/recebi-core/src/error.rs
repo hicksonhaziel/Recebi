@@ -22,4 +22,14 @@ pub enum CoreError {
     AmountOverflow,
     #[error("associated token account derivation failed")]
     AtaDerivation,
+    #[error("PTAX date is invalid")]
+    InvalidPtaxDate,
+    #[error("PTAX decimal is invalid")]
+    InvalidPtaxDecimal,
+    #[error("PTAX response does not satisfy the quote policy")]
+    InvalidPtaxQuote,
+    #[error("valuation amount exceeds supported range")]
+    ValuationOverflow,
+    #[error("operator-supplied USD value is required")]
+    MissingOperatorUsdValue,
 }

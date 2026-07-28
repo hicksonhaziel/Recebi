@@ -7,6 +7,8 @@ use thiserror::Error;
 use crate::health::HealthService;
 use crate::receivable::{CreateRequestInput, ReceivableService};
 use crate::{
+    close_month::{CloseMonthInput, CloseMonthService},
+    ptax::HttpBcbPtax,
     reconcile::{CheckInput, ReconcileOpenInput, ReconciliationService},
     rpc::HttpSolanaRpc,
 };
@@ -24,6 +26,7 @@ pub fn serve(
     health: &HealthService,
     receivables: &ReceivableService,
     reconciliation: &ReconciliationService<HttpSolanaRpc>,
+    closing: &CloseMonthService<HttpBcbPtax>,
 ) -> Result<(), McpError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
@@ -41,7 +44,7 @@ pub fn serve(
             let request = serde_json::from_slice(&line);
             Some(match request {
                 Ok(request) if is_notification(&request) => continue,
-                Ok(request) => dispatch(health, receivables, reconciliation, &request),
+                Ok(request) => dispatch(health, receivables, reconciliation, closing, &request),
                 Err(_) => error_response(&Value::Null, -32700, "parse_error"),
             })
         };
@@ -67,6 +70,7 @@ fn dispatch(
     health: &HealthService,
     receivables: &ReceivableService,
     reconciliation: &ReconciliationService<HttpSolanaRpc>,
+    closing: &CloseMonthService<HttpBcbPtax>,
     request: &Value,
 ) -> Value {
     let Some(object) = request.as_object() else {
@@ -93,13 +97,15 @@ fn dispatch(
                 health_tool_schema(),
                 create_request_tool_schema(),
                 check_tool_schema(),
-                reconcile_open_tool_schema()
+                reconcile_open_tool_schema(),
+                close_month_tool_schema()
             ]}),
         ),
         "tools/call" => call_tool(
             health,
             receivables,
             reconciliation,
+            closing,
             &id,
             object.get("params"),
         ),
@@ -111,6 +117,7 @@ fn call_tool(
     health: &HealthService,
     receivables: &ReceivableService,
     reconciliation: &ReconciliationService<HttpSolanaRpc>,
+    closing: &CloseMonthService<HttpBcbPtax>,
     id: &Value,
     params: Option<&Value>,
 ) -> Value {
@@ -126,8 +133,23 @@ fn call_tool(
         Some("recebi_reconcile_open") => {
             call_reconcile_open(reconciliation, id, params.get("arguments"))
         }
+        Some("recebi_close_month") => call_close_month(closing, id, params.get("arguments")),
         _ => error_response(id, -32602, "unknown_tool"),
     }
+}
+
+fn call_close_month(
+    closing: &CloseMonthService<HttpBcbPtax>,
+    id: &Value,
+    arguments: Option<&Value>,
+) -> Value {
+    let Some(arguments) = arguments else {
+        return error_response(id, -32602, "invalid_close_month_arguments");
+    };
+    let Ok(input) = serde_json::from_value::<CloseMonthInput>(arguments.clone()) else {
+        return error_response(id, -32602, "invalid_close_month_arguments");
+    };
+    tool_result(id, closing.close(input))
 }
 
 fn call_check(
@@ -258,6 +280,25 @@ fn create_request_tool_schema() -> Value {
     })
 }
 
+fn close_month_tool_schema() -> Value {
+    json!({
+        "name": "recebi_close_month",
+        "description": "Attach bounded official same-day BCB PTAX evidence where available and create deterministic accountant-ready monthly JSON/CSV/manifest files. A missing quote never changes verified payment status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "month": {
+                    "type": "string",
+                    "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])$",
+                    "description": "UTC settlement month in YYYY-MM form."
+                }
+            },
+            "required": ["month"],
+            "additionalProperties": false
+        }
+    })
+}
+
 fn check_tool_schema() -> Value {
     json!({
         "name": "recebi_check",
@@ -313,10 +354,14 @@ fn encode_response(response: &Value) -> Vec<u8> {
 mod tests {
     use serde_json::json;
 
-    use super::{create_request_tool_schema, dispatch, encode_response, health_tool_schema};
+    use super::{
+        close_month_tool_schema, create_request_tool_schema, dispatch, encode_response,
+        health_tool_schema,
+    };
     use crate::{
-        config::AppConfig, health::HealthService, receivable::ReceivableService,
-        reconcile::ReconciliationService, rpc::HttpSolanaRpc,
+        close_month::CloseMonthService, config::AppConfig, health::HealthService,
+        ptax::HttpBcbPtax, receivable::ReceivableService, reconcile::ReconciliationService,
+        rpc::HttpSolanaRpc,
     };
 
     fn services() -> (
@@ -324,6 +369,7 @@ mod tests {
         HealthService,
         ReceivableService,
         ReconciliationService<HttpSolanaRpc>,
+        CloseMonthService<HttpBcbPtax>,
     ) {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config_path = directory.path().join("recebi.toml");
@@ -346,8 +392,10 @@ max_open_reconcile = 10
         let config = AppConfig::load(&config_path).expect("load config");
         let health = HealthService::new(config.clone());
         let receivables = ReceivableService::new(config.clone()).expect("receivables");
-        let reconciliation = ReconciliationService::live(config).expect("reconciliation");
-        (directory, health, receivables, reconciliation)
+        let reconciliation = ReconciliationService::live(config.clone()).expect("reconciliation");
+        let closing =
+            CloseMonthService::new(&config, HttpBcbPtax::new().expect("PTAX")).expect("closing");
+        (directory, health, receivables, reconciliation, closing)
     }
 
     #[test]
@@ -368,15 +416,19 @@ max_open_reconcile = 10
         for forbidden_surface in ["wallet", "private_key", "sign", "submit", "refund"] {
             assert!(!schema_keys.contains(forbidden_surface));
         }
+        let close_schema = close_month_tool_schema();
+        assert_eq!(close_schema["name"], "recebi_close_month");
+        assert_eq!(close_schema["inputSchema"]["required"], json!(["month"]));
     }
 
     #[test]
     fn malformed_envelope_is_rejected() {
-        let (_directory, health, receivables, reconciliation) = services();
+        let (_directory, health, receivables, reconciliation, closing) = services();
         let result = dispatch(
             &health,
             &receivables,
             &reconciliation,
+            &closing,
             &json!({"jsonrpc": "2.0", "id": 1}),
         );
         assert_eq!(result["error"]["message"], "invalid_request");
@@ -384,11 +436,12 @@ max_open_reconcile = 10
 
     #[test]
     fn health_rejects_configuration_override_arguments() {
-        let (_directory, health, receivables, reconciliation) = services();
+        let (_directory, health, receivables, reconciliation, closing) = services();
         let result = dispatch(
             &health,
             &receivables,
             &reconciliation,
+            &closing,
             &json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {"name": "recebi_health", "arguments": {"rpc_url": "https://attacker.invalid"}},
@@ -402,11 +455,12 @@ max_open_reconcile = 10
 
     #[test]
     fn create_rejects_memo_and_configuration_override_input() {
-        let (_directory, health, receivables, reconciliation) = services();
+        let (_directory, health, receivables, reconciliation, closing) = services();
         let result = dispatch(
             &health,
             &receivables,
             &reconciliation,
+            &closing,
             &json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {"name": "recebi_create_request", "arguments": {"receivable_id": "ACME-412", "amount": "0.1", "public_label": "ACME", "memo": "private", "rpc_url": "https://attacker.invalid"}},

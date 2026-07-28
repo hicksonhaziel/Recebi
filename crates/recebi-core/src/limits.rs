@@ -11,3 +11,5 @@ pub const MAX_RPC_CALLS_PER_RECEIVABLE: usize = 10;
 pub const MAX_RECONCILE_RECEIVABLES: usize = 10;
 pub const MAX_ANOMALY_SAMPLES: usize = 3;
 pub const RPC_TIMEOUT_SECS: u64 = 5;
+pub const MAX_PTAX_RESPONSE_BYTES: usize = 64 * 1024;
+pub const MAX_MONTH_EXPORT_ROWS: usize = 500;

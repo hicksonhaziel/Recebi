@@ -1,6 +1,6 @@
 ---
 name: recebi
-description: Create and deterministically reconcile safe, reference-bound USDC receivables through the local Recebi MCP server.
+description: Create, deterministically reconcile, and close safe reference-bound USDC receivables through the local Recebi MCP server.
 ---
 
 # Recebi receivables operator
@@ -39,6 +39,18 @@ Use `recebi__recebi_reconcile_open` only for an operator-requested or scheduled
 bounded scan. Pass no arguments or a `max_count` no greater than 10. Report the
 four counts and at most the returned anomaly IDs. Do not retry automatically,
 fetch raw RPC data, inspect transaction memos, or infer settlement from chat.
+
+Use `recebi__recebi_close_month` only when the operator explicitly asks to
+close a UTC settlement month. Pass exactly `month` in `YYYY-MM` form. Report
+the verified, valued, and valuation-pending counts plus the three hashes and
+export directory returned by the tool.
+
+A successful close does not mean every valuation exists. Say
+`valuation_pending` literally when the count is non-zero. Describe the files
+only as “accountant-ready evidence” that “may assist record keeping.” Never
+claim that PTAX proves USDC fair value, tax treatment, DeCripto compliance, or
+legal acceptance. The nominal valuation explicitly assumes 1 USDC = 1 USD and
+uses the official same-day PTAX sale quote; it is not a market-price proof.
 
 Recebi never signs, submits, redirects, swaps, or refunds. Do not look for a
 different tool to perform those actions.
