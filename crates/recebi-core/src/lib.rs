@@ -16,5 +16,5 @@ pub use model::{
 };
 pub use settlement::{
     AccountMeta, CompiledInstruction, SettlementEvidence, SettlementExpectation, SettlementVerdict,
-    TokenAccountSnapshot, TransactionSnapshot, verify_settlement,
+    TokenAccountSnapshot, TransactionSnapshot, verify_settlement, verify_settlement_once,
 };

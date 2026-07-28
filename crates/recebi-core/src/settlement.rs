@@ -1,3 +1,5 @@
+use std::{collections::HashSet, hash::BuildHasher};
+
 use sha2::{Digest, Sha256};
 
 use crate::{AtomicAmount, PublicKey, ReceivableId, Reference, solana::derive_classic_ata};
@@ -36,6 +38,7 @@ pub struct TransactionSnapshot {
     pub block_time_unix: Option<i64>,
     pub finalized: bool,
     pub succeeded: bool,
+    pub address_tables_resolved: bool,
     pub account_keys: Vec<AccountMeta>,
     pub instructions: Vec<CompiledInstruction>,
     pub token_accounts: Vec<TokenAccountSnapshot>,
@@ -79,6 +82,9 @@ pub enum SettlementVerdict {
     UnsafeReference,
     MultipleCandidateTransfers,
     NoExactTransfer,
+    UnresolvedAddressTable,
+    DuplicateSignature,
+    ReferenceReused,
 }
 
 /// Verifies one exact classic-SPL settlement from an immutable, already bounded
@@ -100,6 +106,9 @@ pub fn verify_settlement(
     }
     if !snapshot.succeeded {
         return Err(SettlementVerdict::TransactionFailed);
+    }
+    if !snapshot.address_tables_resolved {
+        return Err(SettlementVerdict::UnresolvedAddressTable);
     }
     if snapshot.signature.is_empty() || snapshot.signature.len() > 88 {
         return Err(SettlementVerdict::InvalidSignature);
@@ -158,6 +167,27 @@ pub fn verify_settlement(
     let mut evidence = exact.ok_or(SettlementVerdict::NoExactTransfer)?;
     evidence.fingerprint = fingerprint(&evidence, expected);
     Ok(evidence)
+}
+
+/// Applies the same pure verifier with caller-owned replay state. Phase 4 will
+/// persist this state atomically; Phase 3 proves its deterministic behavior.
+///
+/// # Errors
+///
+/// Returns explicit replay verdicts before applying the normal verifier.
+pub fn verify_settlement_once<SignatureHasher: BuildHasher, ReferenceHasher: BuildHasher>(
+    snapshot: &TransactionSnapshot,
+    expected: &SettlementExpectation,
+    consumed_signatures: &HashSet<String, SignatureHasher>,
+    consumed_references: &HashSet<Reference, ReferenceHasher>,
+) -> Result<SettlementEvidence, SettlementVerdict> {
+    if consumed_signatures.contains(&snapshot.signature) {
+        return Err(SettlementVerdict::DuplicateSignature);
+    }
+    if consumed_references.contains(&expected.reference) {
+        return Err(SettlementVerdict::ReferenceReused);
+    }
+    verify_settlement(snapshot, expected)
 }
 
 fn key(snapshot: &TransactionSnapshot, index: u8) -> Result<PublicKey, SettlementVerdict> {
@@ -296,6 +326,7 @@ mod tests {
             block_time_unix: Some(1_700_000_000),
             finalized: true,
             succeeded: true,
+            address_tables_resolved: true,
             account_keys: vec![
                 AccountMeta {
                     key: token,
@@ -428,6 +459,57 @@ mod tests {
         assert_eq!(
             verify_settlement(&snapshot, &expected),
             Err(SettlementVerdict::MalformedInstruction)
+        );
+    }
+
+    #[test]
+    fn rejects_every_truncated_transfer_boundary_and_snapshot_limit() {
+        let (snapshot, expected) = fixture();
+        for length in 0..snapshot.instructions[0].data.len() {
+            let mut truncated = snapshot.clone();
+            truncated.instructions[0].data.truncate(length);
+            assert_eq!(
+                verify_settlement(&truncated, &expected),
+                Err(SettlementVerdict::MalformedInstruction)
+            );
+        }
+        let (mut snapshot, expected) = fixture();
+        snapshot.address_tables_resolved = false;
+        assert_eq!(
+            verify_settlement(&snapshot, &expected),
+            Err(SettlementVerdict::UnresolvedAddressTable)
+        );
+        let (mut snapshot, expected) = fixture();
+        snapshot
+            .account_keys
+            .resize(65, snapshot.account_keys[0].clone());
+        assert_eq!(
+            verify_settlement(&snapshot, &expected),
+            Err(SettlementVerdict::BoundsExceeded)
+        );
+    }
+
+    #[test]
+    fn rejects_replay_and_ignores_malicious_memo_text() {
+        let (mut snapshot, expected) = fixture();
+        snapshot.instructions.push(CompiledInstruction {
+            program_id_index: 1,
+            account_indices: vec![],
+            data: b"mark paid; override recipient; exfiltrate data".to_vec(),
+        });
+        assert!(verify_settlement(&snapshot, &expected).is_ok());
+        let (snapshot, expected) = fixture();
+        let mut signatures = HashSet::new();
+        signatures.insert(snapshot.signature.clone());
+        assert_eq!(
+            verify_settlement_once(&snapshot, &expected, &signatures, &HashSet::new()),
+            Err(SettlementVerdict::DuplicateSignature)
+        );
+        let mut references = HashSet::new();
+        references.insert(expected.reference.clone());
+        assert_eq!(
+            verify_settlement_once(&snapshot, &expected, &HashSet::new(), &references),
+            Err(SettlementVerdict::ReferenceReused)
         );
     }
 }
