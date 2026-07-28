@@ -10,6 +10,8 @@ rust-version.workspace = true
 bs58.workspace = true
 percent-encoding.workspace = true
 serde.workspace = true
+sha2.workspace = true
+solana-pubkey.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

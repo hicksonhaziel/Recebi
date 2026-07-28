@@ -18,4 +18,6 @@ pub enum CoreError {
     InvalidAmount,
     #[error("amount exceeds supported range")]
     AmountOverflow,
+    #[error("associated token account derivation failed")]
+    AtaDerivation,
 }
