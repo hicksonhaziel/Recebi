@@ -7,8 +7,9 @@ use std::{
 use recebi_core::{
     AtomicAmount, BoundedText, NOMINAL_USDC_USD_METHOD, PaymentRequest, PtaxDate, PtaxEvidence,
     PublicKey, ReceivableId, ReceivableState, Reference, ReviewResolutionAction,
-    SettlementEvidence,
+    SettlementEvidence, UnderpaymentEvidence, VarianceReason,
     limits::{MAX_MONTH_EXPORT_ROWS, MAX_PUBLIC_LABEL_BYTES},
+    solana::derive_classic_ata,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -50,8 +51,21 @@ pub struct StoredReceivable {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredReviewCandidate {
     pub signature: String,
+    pub slot: u64,
     pub verdict: String,
     pub candidate_fingerprint: String,
+    pub underpayment: Option<StoredUnderpaymentEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredUnderpaymentEvidence {
+    pub block_time_unix: i64,
+    pub recipient: PublicKey,
+    pub mint: PublicKey,
+    pub expected_amount: AtomicAmount,
+    pub received_amount: AtomicAmount,
+    pub shortfall_amount: AtomicAmount,
+    pub instruction_position: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,7 +81,22 @@ pub struct StoredSettledReceivable {
     pub slot: u64,
     pub block_time_unix: i64,
     pub settlement_fingerprint: String,
+    pub settlement_kind: String,
+    pub expected_amount: AtomicAmount,
+    pub received_amount: AtomicAmount,
+    pub variance_reason: Option<VarianceReason>,
+    pub approval_run_id: Option<String>,
     pub valuation: Option<StoredValuation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredSettlementSummary {
+    pub signature: String,
+    pub settlement_kind: String,
+    pub expected_amount: AtomicAmount,
+    pub received_amount: AtomicAmount,
+    pub variance_reason: Option<VarianceReason>,
+    pub approval_run_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,7 +135,7 @@ impl ReceivableStore {
                  decimals INTEGER NOT NULL,
                  reference TEXT NOT NULL UNIQUE,
                  public_label TEXT NOT NULL,
-                 state TEXT NOT NULL CHECK(state IN ('open','payment_verified','needs_review','cancelled')),
+                 state TEXT NOT NULL CHECK(state IN ('open','payment_verified','needs_review','cancelled','settled_with_variance')),
                  created_at_unix_ms INTEGER NOT NULL,
                  solana_pay_url TEXT NOT NULL
              );
@@ -132,7 +161,11 @@ impl ReceivableStore {
                  atomic_amount INTEGER NOT NULL,
                  instruction_position INTEGER NOT NULL,
                  fingerprint TEXT NOT NULL UNIQUE,
-                 observed_at_unix_ms INTEGER NOT NULL
+                 observed_at_unix_ms INTEGER NOT NULL,
+                 settlement_kind TEXT NOT NULL CHECK(settlement_kind IN ('exact','accepted_underpayment')) DEFAULT 'exact',
+                 expected_atomic_amount INTEGER NOT NULL,
+                 variance_reason TEXT CHECK(variance_reason IN ('rounding_adjustment','commercial_discount','merchant_write_off')),
+                 approval_run_id TEXT
              );
              CREATE TABLE IF NOT EXISTS review_candidates (
                  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,12 +174,21 @@ impl ReceivableStore {
                  slot INTEGER NOT NULL,
                  verdict TEXT NOT NULL,
                  candidate_fingerprint TEXT NOT NULL UNIQUE,
-                 observed_at_unix_ms INTEGER NOT NULL
+                 observed_at_unix_ms INTEGER NOT NULL,
+                 block_time_unix INTEGER,
+                 recipient TEXT,
+                 mint TEXT,
+                 expected_atomic_amount INTEGER,
+                 received_atomic_amount INTEGER,
+                 shortfall_atomic_amount INTEGER,
+                 instruction_position INTEGER
              );
              CREATE TABLE IF NOT EXISTS review_resolutions (
                  candidate_fingerprint TEXT PRIMARY KEY NOT NULL,
                  receivable_id TEXT NOT NULL,
-                 action TEXT NOT NULL CHECK(action IN ('ignore_candidate_and_reopen','cancel_unpaid')),
+                 action TEXT NOT NULL CHECK(action IN ('ignore_candidate_and_reopen','cancel_unpaid','accept_underpayment_with_variance')),
+                 variance_reason TEXT CHECK(variance_reason IN ('rounding_adjustment','commercial_discount','merchant_write_off')),
+                 approval_run_id TEXT,
                  resolved_at_unix_ms INTEGER NOT NULL
              );
              CREATE TRIGGER IF NOT EXISTS review_candidates_no_update BEFORE UPDATE ON review_candidates BEGIN SELECT RAISE(ABORT, 'append_only'); END;
@@ -209,6 +251,7 @@ impl ReceivableStore {
         migrate_state_constraint(&connection)?;
         migrate_phase_five_schema(&connection)?;
         migrate_phase_six_schema(&connection)?;
+        migrate_variance_schema(&connection)?;
         initialize_ledger_checkpoints(&connection)?;
         secure_file(&store.path)?;
         Ok(store)
@@ -373,8 +416,9 @@ impl ReceivableStore {
         let inserted = transaction.execute(
             "INSERT INTO settlements (
                 receivable_id,signature,reference,slot,block_time_unix,recipient,mint,
-                atomic_amount,instruction_position,fingerprint,observed_at_unix_ms
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                atomic_amount,instruction_position,fingerprint,observed_at_unix_ms,
+                settlement_kind,expected_atomic_amount,variance_reason,approval_run_id
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'exact',?12,NULL,NULL)",
             params![
                 receivable_id.as_str(),
                 evidence.signature,
@@ -387,7 +431,8 @@ impl ReceivableStore {
                 i64::try_from(evidence.transfer_instruction_position)
                     .map_err(|_| StoreError::Unavailable)?,
                 evidence.fingerprint,
-                observed_at_unix_ms
+                observed_at_unix_ms,
+                i64::try_from(evidence.amount.get()).map_err(|_| StoreError::Unavailable)?
             ],
         );
         if inserted.is_err() {
@@ -426,6 +471,59 @@ impl ReceivableStore {
         candidate_fingerprint: &str,
         observed_at_unix_ms: i64,
     ) -> Result<(), StoreError> {
+        self.mark_review_candidate(
+            receivable_id,
+            signature,
+            slot,
+            verdict,
+            candidate_fingerprint,
+            None,
+            observed_at_unix_ms,
+        )
+    }
+
+    /// Atomically records a canonical underpayment with transaction-derived
+    /// expected, received, and shortfall amounts. It remains `needs_review`
+    /// until a separate operator approval is durably applied.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on inconsistent evidence, stale state, or storage failure.
+    pub fn mark_underpayment_review(
+        &self,
+        receivable_id: &ReceivableId,
+        evidence: &UnderpaymentEvidence,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        if evidence.expected_amount <= evidence.received_amount
+            || evidence.received_amount.get() == 0
+            || evidence.shortfall_amount.get()
+                != evidence.expected_amount.get() - evidence.received_amount.get()
+        {
+            return Err(StoreError::Integrity);
+        }
+        self.mark_review_candidate(
+            receivable_id,
+            &evidence.signature,
+            evidence.slot,
+            "wrong_amount",
+            &evidence.fingerprint,
+            Some(evidence),
+            observed_at_unix_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mark_review_candidate(
+        &self,
+        receivable_id: &ReceivableId,
+        signature: &str,
+        slot: u64,
+        verdict: &str,
+        candidate_fingerprint: &str,
+        underpayment: Option<&UnderpaymentEvidence>,
+        observed_at_unix_ms: i64,
+    ) -> Result<(), StoreError> {
         self.verify_ledger_integrity()?;
         let mut connection = self.connection()?;
         let transaction = connection
@@ -443,15 +541,37 @@ impl ReceivableStore {
         transaction
             .execute(
                 "INSERT INTO review_candidates (
-                    receivable_id,signature,slot,verdict,candidate_fingerprint,observed_at_unix_ms
-                 ) VALUES (?1,?2,?3,?4,?5,?6)",
+                    receivable_id,signature,slot,verdict,candidate_fingerprint,
+                    observed_at_unix_ms,block_time_unix,recipient,mint,
+                    expected_atomic_amount,received_atomic_amount,
+                    shortfall_atomic_amount,instruction_position
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 params![
                     receivable_id.as_str(),
                     signature,
                     i64::try_from(slot).map_err(|_| StoreError::Unavailable)?,
                     verdict,
                     candidate_fingerprint,
-                    observed_at_unix_ms
+                    observed_at_unix_ms,
+                    underpayment.and_then(|evidence| evidence.block_time_unix),
+                    underpayment.map(|evidence| evidence.recipient.as_str()),
+                    underpayment.map(|evidence| evidence.mint.as_str()),
+                    underpayment
+                        .map(|evidence| i64::try_from(evidence.expected_amount.get()))
+                        .transpose()
+                        .map_err(|_| StoreError::Unavailable)?,
+                    underpayment
+                        .map(|evidence| i64::try_from(evidence.received_amount.get()))
+                        .transpose()
+                        .map_err(|_| StoreError::Unavailable)?,
+                    underpayment
+                        .map(|evidence| i64::try_from(evidence.shortfall_amount.get()))
+                        .transpose()
+                        .map_err(|_| StoreError::Unavailable)?,
+                    underpayment
+                        .map(|evidence| i64::try_from(evidence.transfer_instruction_position))
+                        .transpose()
+                        .map_err(|_| StoreError::Unavailable)?
                 ],
             )
             .map_err(|_| StoreError::Unavailable)?;
@@ -459,7 +579,10 @@ impl ReceivableStore {
             &transaction,
             receivable_id,
             format!(
-                "event=needs_review\nsignature={signature}\nslot={slot}\nverdict={verdict}\ncandidate_fingerprint={candidate_fingerprint}\nobserved_at_unix_ms={observed_at_unix_ms}\n"
+                "event=needs_review\nsignature={signature}\nslot={slot}\nverdict={verdict}\ncandidate_fingerprint={candidate_fingerprint}\nexpected_atomic_amount={}\nreceived_atomic_amount={}\nshortfall_atomic_amount={}\nobserved_at_unix_ms={observed_at_unix_ms}\n",
+                underpayment.map(|evidence| evidence.expected_amount.get()).map_or_else(|| "unavailable".to_owned(), |value| value.to_string()),
+                underpayment.map(|evidence| evidence.received_amount.get()).map_or_else(|| "unavailable".to_owned(), |value| value.to_string()),
+                underpayment.map(|evidence| evidence.shortfall_amount.get()).map_or_else(|| "unavailable".to_owned(), |value| value.to_string()),
             )
             .as_bytes(),
         )?;
@@ -611,6 +734,63 @@ impl ReceivableStore {
             .map_err(|_| StoreError::Unavailable)
     }
 
+    /// Returns the compact immutable settlement summary for operator status.
+    ///
+    /// # Errors
+    ///
+    /// Malformed evidence, integrity failure, or storage failure fails closed.
+    pub fn settlement_summary(
+        &self,
+        receivable_id: &ReceivableId,
+    ) -> Result<Option<StoredSettlementSummary>, StoreError> {
+        self.verify_ledger_integrity()?;
+        let raw = self
+            .connection()?
+            .query_row(
+                "SELECT signature,settlement_kind,expected_atomic_amount,
+                        atomic_amount,variance_reason,approval_run_id
+                 FROM settlements WHERE receivable_id=?1",
+                [receivable_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?;
+        raw.map(
+            |(signature, kind, expected, received, reason, approval_run_id)| {
+                let variance_reason = reason
+                    .map(|value| parse_variance_reason(&value))
+                    .transpose()?;
+                if (kind == "accepted_underpayment") != variance_reason.is_some()
+                    || (kind != "exact" && kind != "accepted_underpayment")
+                {
+                    return Err(StoreError::Integrity);
+                }
+                Ok(StoredSettlementSummary {
+                    signature,
+                    settlement_kind: kind,
+                    expected_amount: AtomicAmount::new(
+                        u64::try_from(expected).map_err(|_| StoreError::Integrity)?,
+                    ),
+                    received_amount: AtomicAmount::new(
+                        u64::try_from(received).map_err(|_| StoreError::Integrity)?,
+                    ),
+                    variance_reason,
+                    approval_run_id,
+                })
+            },
+        )
+        .transpose()
+    }
+
     /// Returns the bounded candidate summary for a receivable in review.
     ///
     /// # Errors
@@ -623,7 +803,10 @@ impl ReceivableStore {
         self.verify_ledger_integrity()?;
         self.connection()?
             .query_row(
-                "SELECT c.signature,c.verdict,c.candidate_fingerprint
+                "SELECT c.signature,c.slot,c.verdict,c.candidate_fingerprint,
+                        c.block_time_unix,c.recipient,c.mint,
+                        c.expected_atomic_amount,c.received_atomic_amount,
+                        c.shortfall_atomic_amount,c.instruction_position
                  FROM review_candidates c
                  LEFT JOIN review_resolutions r USING(candidate_fingerprint)
                  WHERE c.receivable_id = ?1 AND r.candidate_fingerprint IS NULL
@@ -632,8 +815,11 @@ impl ReceivableStore {
                 |row| {
                     Ok(StoredReviewCandidate {
                         signature: row.get(0)?,
-                        verdict: row.get(1)?,
-                        candidate_fingerprint: row.get(2)?,
+                        slot: u64::try_from(row.get::<_, i64>(1)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        verdict: row.get(2)?,
+                        candidate_fingerprint: row.get(3)?,
+                        underpayment: parse_stored_underpayment(row)?,
                     })
                 },
             )
@@ -672,73 +858,217 @@ impl ReceivableStore {
     ///
     /// A stale fingerprint, unsupported state, conflicting retry, integrity
     /// failure, or storage failure fails closed.
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    // Keeping the reads, invariant checks, writes, event, and checkpoint in one
+    // immediate transaction makes this security boundary auditable as a unit.
     pub fn resolve_review(
         &self,
         receivable_id: &ReceivableId,
         candidate_fingerprint: &str,
         action: ReviewResolutionAction,
+        variance_reason: Option<VarianceReason>,
         approval_run_id: &str,
         resolved_at_unix_ms: i64,
     ) -> Result<ReceivableState, StoreError> {
+        if (action == ReviewResolutionAction::AcceptUnderpaymentWithVariance)
+            != variance_reason.is_some()
+        {
+            return Err(StoreError::InvalidTransition);
+        }
         self.verify_ledger_integrity()?;
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| StoreError::Unavailable)?;
-        let existing: Option<(String, String)> = transaction
+        let existing: Option<(String, String, Option<String>)> = transaction
             .query_row(
-                "SELECT receivable_id,action FROM review_resolutions
+                "SELECT receivable_id,action,variance_reason FROM review_resolutions
                  WHERE candidate_fingerprint=?1",
                 [candidate_fingerprint],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|_| StoreError::Unavailable)?;
         let target_state = match action {
             ReviewResolutionAction::IgnoreCandidateAndReopen => ReceivableState::Open,
             ReviewResolutionAction::CancelUnpaid => ReceivableState::Cancelled,
+            ReviewResolutionAction::AcceptUnderpaymentWithVariance => {
+                ReceivableState::SettledWithVariance
+            }
         };
-        if let Some((existing_id, existing_action)) = existing {
-            return if existing_id == receivable_id.as_str() && existing_action == action.as_str() {
+        if let Some((existing_id, existing_action, existing_reason)) = existing {
+            return if existing_id == receivable_id.as_str()
+                && existing_action == action.as_str()
+                && existing_reason.as_deref() == variance_reason.map(VarianceReason::as_str)
+            {
                 transaction.commit().map_err(|_| StoreError::Unavailable)?;
                 Ok(target_state)
             } else {
                 Err(StoreError::InvalidTransition)
             };
         }
-        let current: Option<(String, String)> = transaction
+        let current: Option<(
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            String,
+            String,
+            String,
+            String,
+            i64,
+        )> = transaction
             .query_row(
-                "SELECT r.state,c.candidate_fingerprint
+                "SELECT r.state,c.candidate_fingerprint,c.signature,c.slot,
+                        c.block_time_unix,c.recipient,c.mint,
+                        c.expected_atomic_amount,c.received_atomic_amount,
+                        c.shortfall_atomic_amount,c.instruction_position,
+                        c.verdict,r.reference,r.recipient,r.mint,r.atomic_amount
                  FROM receivables r JOIN review_candidates c USING(receivable_id)
                  LEFT JOIN review_resolutions d USING(candidate_fingerprint)
                  WHERE r.receivable_id=?1 AND d.candidate_fingerprint IS NULL
                  ORDER BY c.sequence DESC LIMIT 1",
                 [receivable_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|_| StoreError::Unavailable)?;
-        if !current.as_ref().is_some_and(|(state, fingerprint)| {
-            state == "needs_review" && fingerprint == candidate_fingerprint
-        }) {
+        let Some((
+            state,
+            fingerprint,
+            signature,
+            slot,
+            block_time,
+            candidate_recipient,
+            candidate_mint,
+            expected,
+            received,
+            shortfall,
+            instruction_position,
+            candidate_verdict,
+            reference,
+            configured_recipient,
+            configured_mint,
+            configured_amount,
+        )) = current
+        else {
+            return Err(StoreError::InvalidTransition);
+        };
+        if state != "needs_review" || fingerprint != candidate_fingerprint {
             return Err(StoreError::InvalidTransition);
         }
         transaction
             .execute(
                 "INSERT INTO review_resolutions (
-                    candidate_fingerprint,receivable_id,action,resolved_at_unix_ms
-                 ) VALUES (?1,?2,?3,?4)",
+                    candidate_fingerprint,receivable_id,action,variance_reason,
+                    approval_run_id,resolved_at_unix_ms
+                 ) VALUES (?1,?2,?3,?4,?5,?6)",
                 params![
                     candidate_fingerprint,
                     receivable_id.as_str(),
                     action.as_str(),
+                    variance_reason.map(VarianceReason::as_str),
+                    approval_run_id,
                     resolved_at_unix_ms
                 ],
             )
             .map_err(|_| StoreError::Unavailable)?;
+        if action == ReviewResolutionAction::AcceptUnderpaymentWithVariance {
+            let (
+                Some(block_time),
+                Some(candidate_recipient),
+                Some(candidate_mint),
+                Some(expected),
+                Some(received),
+                Some(shortfall),
+                Some(instruction_position),
+            ) = (
+                block_time,
+                candidate_recipient,
+                candidate_mint,
+                expected,
+                received,
+                shortfall,
+                instruction_position,
+            )
+            else {
+                return Err(StoreError::InvalidTransition);
+            };
+            let merchant_wallet =
+                PublicKey::parse(configured_recipient).map_err(|_| StoreError::Integrity)?;
+            let configured_mint_key =
+                PublicKey::parse(configured_mint.clone()).map_err(|_| StoreError::Integrity)?;
+            let expected_recipient = derive_classic_ata(&merchant_wallet, &configured_mint_key)
+                .map_err(|_| StoreError::Integrity)?;
+            if expected <= 0
+                || received <= 0
+                || received >= expected
+                || shortfall != expected - received
+                || candidate_verdict != "wrong_amount"
+                || expected != configured_amount
+                || candidate_recipient != expected_recipient.as_str()
+                || candidate_mint != configured_mint
+            {
+                return Err(StoreError::InvalidTransition);
+            }
+            transaction
+                .execute(
+                    "INSERT INTO settlements (
+                        receivable_id,signature,reference,slot,block_time_unix,
+                        recipient,mint,atomic_amount,instruction_position,
+                        fingerprint,observed_at_unix_ms,settlement_kind,
+                        expected_atomic_amount,variance_reason,approval_run_id
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,
+                               'accepted_underpayment',?12,?13,?14)",
+                    params![
+                        receivable_id.as_str(),
+                        signature,
+                        reference,
+                        slot,
+                        block_time,
+                        candidate_recipient,
+                        candidate_mint,
+                        received,
+                        instruction_position,
+                        candidate_fingerprint,
+                        resolved_at_unix_ms,
+                        expected,
+                        variance_reason.map(VarianceReason::as_str),
+                        approval_run_id
+                    ],
+                )
+                .map_err(|_| StoreError::Replay)?;
+        }
         let state = match target_state {
             ReceivableState::Open => "open",
             ReceivableState::Cancelled => "cancelled",
+            ReceivableState::SettledWithVariance => "settled_with_variance",
             _ => return Err(StoreError::Integrity),
         };
         let changed = transaction
@@ -754,10 +1084,21 @@ impl ReceivableStore {
         append_event(
             &transaction,
             receivable_id,
-            format!(
-                "event=review_resolved\ncandidate_fingerprint={candidate_fingerprint}\naction={}\napproval_run_id={approval_run_id}\nresolved_at_unix_ms={resolved_at_unix_ms}\n",
-                action.as_str(),
-            )
+            if action == ReviewResolutionAction::AcceptUnderpaymentWithVariance {
+                format!(
+                    "event=review_resolved\ncandidate_fingerprint={candidate_fingerprint}\naction={}\nexpected_atomic_amount={}\nreceived_atomic_amount={}\nshortfall_atomic_amount={}\nvariance_reason={}\napproval_run_id={approval_run_id}\nresolved_at_unix_ms={resolved_at_unix_ms}\n",
+                    action.as_str(),
+                    expected.ok_or(StoreError::Integrity)?,
+                    received.ok_or(StoreError::Integrity)?,
+                    shortfall.ok_or(StoreError::Integrity)?,
+                    variance_reason.ok_or(StoreError::Integrity)?.as_str(),
+                )
+            } else {
+                format!(
+                    "event=review_resolved\ncandidate_fingerprint={candidate_fingerprint}\naction={}\napproval_run_id={approval_run_id}\nresolved_at_unix_ms={resolved_at_unix_ms}\n",
+                    action.as_str(),
+                )
+            }
             .as_bytes(),
         )?;
         append_ledger_checkpoint(&transaction)?;
@@ -789,7 +1130,10 @@ impl ReceivableStore {
             )
             .optional()
             .map_err(|_| StoreError::Unavailable)?;
-        if state.as_deref() != Some("payment_verified") {
+        if !matches!(
+            state.as_deref(),
+            Some("payment_verified" | "settled_with_variance")
+        ) {
             return Err(StoreError::InvalidTransition);
         }
         let existing: Option<(String, String, i64)> = transaction
@@ -869,7 +1213,7 @@ impl ReceivableStore {
             .query_row(
                 "SELECT COUNT(*)
                  FROM receivables r LEFT JOIN settlements s USING(receivable_id)
-                 WHERE r.state = 'payment_verified'
+                 WHERE r.state IN ('payment_verified','settled_with_variance')
                    AND (s.receivable_id IS NULL OR s.block_time_unix IS NULL)",
                 [],
                 |row| row.get(0),
@@ -880,7 +1224,9 @@ impl ReceivableStore {
         }
         let mut statement = connection
             .prepare(
-                "SELECT r.receivable_id,s.signature,s.slot,s.block_time_unix,s.fingerprint
+                "SELECT r.receivable_id,s.signature,s.slot,s.block_time_unix,
+                        s.fingerprint,s.settlement_kind,s.expected_atomic_amount,
+                        s.atomic_amount,s.variance_reason,s.approval_run_id
                  FROM receivables r JOIN settlements s USING(receivable_id)
                  WHERE s.block_time_unix >= ?1 AND s.block_time_unix < ?2
                  ORDER BY s.block_time_unix,r.receivable_id LIMIT ?3",
@@ -901,6 +1247,11 @@ impl ReceivableStore {
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<i64>>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
                     ))
                 },
             )
@@ -911,18 +1262,49 @@ impl ReceivableStore {
             return Err(StoreError::Integrity);
         }
         rows.into_iter()
-            .map(|(id, signature, slot, block_time, fingerprint)| {
-                let receivable = find_in(&connection, &id)?.ok_or(StoreError::Integrity)?;
-                let valuation = find_valuation_in(&connection, &id)?;
-                Ok(StoredSettledReceivable {
-                    receivable,
+            .map(
+                |(
+                    id,
                     signature,
-                    slot: u64::try_from(slot).map_err(|_| StoreError::Integrity)?,
-                    block_time_unix: block_time.ok_or(StoreError::Integrity)?,
-                    settlement_fingerprint: fingerprint,
-                    valuation,
-                })
-            })
+                    slot,
+                    block_time,
+                    fingerprint,
+                    settlement_kind,
+                    expected_amount,
+                    received_amount,
+                    variance_reason,
+                    approval_run_id,
+                )| {
+                    let receivable = find_in(&connection, &id)?.ok_or(StoreError::Integrity)?;
+                    let valuation = find_valuation_in(&connection, &id)?;
+                    let variance_reason = variance_reason
+                        .map(|reason| parse_variance_reason(&reason))
+                        .transpose()?;
+                    if (settlement_kind == "accepted_underpayment") != variance_reason.is_some()
+                        || (settlement_kind != "exact"
+                            && settlement_kind != "accepted_underpayment")
+                    {
+                        return Err(StoreError::Integrity);
+                    }
+                    Ok(StoredSettledReceivable {
+                        receivable,
+                        signature,
+                        slot: u64::try_from(slot).map_err(|_| StoreError::Integrity)?,
+                        block_time_unix: block_time.ok_or(StoreError::Integrity)?,
+                        settlement_fingerprint: fingerprint,
+                        settlement_kind,
+                        expected_amount: AtomicAmount::new(
+                            u64::try_from(expected_amount).map_err(|_| StoreError::Integrity)?,
+                        ),
+                        received_amount: AtomicAmount::new(
+                            u64::try_from(received_amount).map_err(|_| StoreError::Integrity)?,
+                        ),
+                        variance_reason,
+                        approval_run_id,
+                        valuation,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -1117,6 +1499,57 @@ fn find_valuation_in(
     .transpose()
 }
 
+fn parse_stored_underpayment(
+    row: &rusqlite::Row<'_>,
+) -> Result<Option<StoredUnderpaymentEvidence>, rusqlite::Error> {
+    let values = (
+        row.get::<_, Option<i64>>(4)?,
+        row.get::<_, Option<String>>(5)?,
+        row.get::<_, Option<String>>(6)?,
+        row.get::<_, Option<i64>>(7)?,
+        row.get::<_, Option<i64>>(8)?,
+        row.get::<_, Option<i64>>(9)?,
+        row.get::<_, Option<i64>>(10)?,
+    );
+    match values {
+        (
+            Some(block_time),
+            Some(recipient),
+            Some(mint),
+            Some(expected),
+            Some(received),
+            Some(shortfall),
+            Some(position),
+        ) => Ok(Some(StoredUnderpaymentEvidence {
+            block_time_unix: block_time,
+            recipient: PublicKey::parse(recipient).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            mint: PublicKey::parse(mint).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            expected_amount: AtomicAmount::new(
+                u64::try_from(expected).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            ),
+            received_amount: AtomicAmount::new(
+                u64::try_from(received).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            ),
+            shortfall_amount: AtomicAmount::new(
+                u64::try_from(shortfall).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            ),
+            instruction_position: usize::try_from(position)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        })),
+        (None, None, None, None, None, None, None) => Ok(None),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn parse_variance_reason(value: &str) -> Result<VarianceReason, StoreError> {
+    match value {
+        "rounding_adjustment" => Ok(VarianceReason::RoundingAdjustment),
+        "commercial_discount" => Ok(VarianceReason::CommercialDiscount),
+        "merchant_write_off" => Ok(VarianceReason::MerchantWriteOff),
+        _ => Err(StoreError::Integrity),
+    }
+}
+
 fn find_month_close_in(
     connection: &Connection,
     month: &str,
@@ -1201,15 +1634,6 @@ fn migrate_phase_five_schema(connection: &Connection) -> Result<(), StoreError> 
     if installed {
         return Ok(());
     }
-    let checkpoints_installed = connection
-        .query_row(
-            "SELECT 1 FROM schema_migrations WHERE version=5",
-            [],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|_| StoreError::Unavailable)?
-        .is_some();
     connection
         .execute_batch(
             "BEGIN IMMEDIATE;
@@ -1262,9 +1686,6 @@ fn migrate_phase_five_schema(connection: &Connection) -> Result<(), StoreError> 
             .map_err(|_| StoreError::Unavailable)?;
     }
     refresh_month_close_hashes(connection)?;
-    if checkpoints_installed {
-        append_ledger_checkpoint(connection)?;
-    }
     connection
         .execute_batch(
             "CREATE TRIGGER IF NOT EXISTS valuations_no_update BEFORE UPDATE ON valuations BEGIN SELECT RAISE(ABORT, 'append_only'); END;
@@ -1354,15 +1775,6 @@ fn migrate_phase_six_schema(connection: &Connection) -> Result<(), StoreError> {
     if installed {
         return Ok(());
     }
-    let checkpoints_installed = connection
-        .query_row(
-            "SELECT 1 FROM schema_migrations WHERE version=5",
-            [],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|_| StoreError::Unavailable)?
-        .is_some();
     connection
         .execute_batch("BEGIN IMMEDIATE;")
         .map_err(|_| StoreError::Unavailable)?;
@@ -1432,12 +1844,144 @@ fn migrate_phase_six_schema(connection: &Connection) -> Result<(), StoreError> {
             )
             .map_err(|_| StoreError::Unavailable)?;
     }
-    if checkpoints_installed {
-        append_ledger_checkpoint(connection)?;
-    }
     connection
         .execute_batch(
             "INSERT INTO schema_migrations(version) VALUES (7);
+             COMMIT;",
+        )
+        .map_err(|_| StoreError::Unavailable)
+}
+
+#[allow(clippy::too_many_lines)]
+// One transactional SQL batch keeps the table rebuild all-or-nothing.
+fn migrate_variance_schema(connection: &Connection) -> Result<(), StoreError> {
+    let installed = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version=8",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| StoreError::Unavailable)?
+        .is_some();
+    let needs_rebuild = !column_exists(connection, "settlements", "settlement_kind")?
+        || !column_exists(connection, "review_candidates", "received_atomic_amount")?
+        || !column_exists(connection, "review_resolutions", "approval_run_id")?;
+    if installed && !needs_rebuild {
+        return Ok(());
+    }
+    connection
+        .execute_batch("BEGIN IMMEDIATE;")
+        .map_err(|_| StoreError::Unavailable)?;
+    if needs_rebuild {
+        connection
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS review_candidates_no_update;
+                 DROP TRIGGER IF EXISTS review_candidates_no_delete;
+                 DROP TRIGGER IF EXISTS review_resolutions_no_update;
+                 DROP TRIGGER IF EXISTS review_resolutions_no_delete;
+
+                 ALTER TABLE receivables RENAME TO receivables_phase6;
+                 CREATE TABLE receivables (
+                    receivable_id TEXT PRIMARY KEY NOT NULL,
+                    recipient TEXT NOT NULL,
+                    mint TEXT NOT NULL,
+                    atomic_amount INTEGER NOT NULL,
+                    decimals INTEGER NOT NULL,
+                    reference TEXT NOT NULL UNIQUE,
+                    public_label TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('open','payment_verified','needs_review','cancelled','settled_with_variance')),
+                    created_at_unix_ms INTEGER NOT NULL,
+                    solana_pay_url TEXT NOT NULL
+                 );
+                 INSERT INTO receivables SELECT * FROM receivables_phase6;
+                 DROP TABLE receivables_phase6;
+
+                 ALTER TABLE settlements RENAME TO settlements_phase6;
+                 CREATE TABLE settlements (
+                    receivable_id TEXT PRIMARY KEY NOT NULL,
+                    signature TEXT NOT NULL UNIQUE,
+                    reference TEXT NOT NULL UNIQUE,
+                    slot INTEGER NOT NULL,
+                    block_time_unix INTEGER,
+                    recipient TEXT NOT NULL,
+                    mint TEXT NOT NULL,
+                    atomic_amount INTEGER NOT NULL,
+                    instruction_position INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    observed_at_unix_ms INTEGER NOT NULL,
+                    settlement_kind TEXT NOT NULL CHECK(settlement_kind IN ('exact','accepted_underpayment')),
+                    expected_atomic_amount INTEGER NOT NULL,
+                    variance_reason TEXT CHECK(variance_reason IN ('rounding_adjustment','commercial_discount','merchant_write_off')),
+                    approval_run_id TEXT
+                 );
+                 INSERT INTO settlements (
+                    receivable_id,signature,reference,slot,block_time_unix,
+                    recipient,mint,atomic_amount,instruction_position,fingerprint,
+                    observed_at_unix_ms,settlement_kind,expected_atomic_amount,
+                    variance_reason,approval_run_id
+                 )
+                 SELECT receivable_id,signature,reference,slot,block_time_unix,
+                        recipient,mint,atomic_amount,instruction_position,fingerprint,
+                        observed_at_unix_ms,'exact',atomic_amount,NULL,NULL
+                 FROM settlements_phase6;
+                 DROP TABLE settlements_phase6;
+
+                 ALTER TABLE review_candidates RENAME TO review_candidates_phase6_variance;
+                 CREATE TABLE review_candidates (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    receivable_id TEXT NOT NULL,
+                    signature TEXT NOT NULL,
+                    slot INTEGER NOT NULL,
+                    verdict TEXT NOT NULL,
+                    candidate_fingerprint TEXT NOT NULL UNIQUE,
+                    observed_at_unix_ms INTEGER NOT NULL,
+                    block_time_unix INTEGER,
+                    recipient TEXT,
+                    mint TEXT,
+                    expected_atomic_amount INTEGER,
+                    received_atomic_amount INTEGER,
+                    shortfall_atomic_amount INTEGER,
+                    instruction_position INTEGER
+                 );
+                 INSERT INTO review_candidates (
+                    sequence,receivable_id,signature,slot,verdict,
+                    candidate_fingerprint,observed_at_unix_ms
+                 )
+                 SELECT sequence,receivable_id,signature,slot,verdict,
+                        candidate_fingerprint,observed_at_unix_ms
+                 FROM review_candidates_phase6_variance;
+                 DROP TABLE review_candidates_phase6_variance;
+
+                 ALTER TABLE review_resolutions RENAME TO review_resolutions_phase6;
+                 CREATE TABLE review_resolutions (
+                    candidate_fingerprint TEXT PRIMARY KEY NOT NULL,
+                    receivable_id TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('ignore_candidate_and_reopen','cancel_unpaid','accept_underpayment_with_variance')),
+                    variance_reason TEXT CHECK(variance_reason IN ('rounding_adjustment','commercial_discount','merchant_write_off')),
+                    approval_run_id TEXT,
+                    resolved_at_unix_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO review_resolutions (
+                    candidate_fingerprint,receivable_id,action,resolved_at_unix_ms
+                 )
+                 SELECT candidate_fingerprint,receivable_id,action,resolved_at_unix_ms
+                 FROM review_resolutions_phase6;
+                 DROP TABLE review_resolutions_phase6;
+
+                 CREATE TRIGGER review_candidates_no_update BEFORE UPDATE ON review_candidates BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+                 CREATE TRIGGER review_candidates_no_delete BEFORE DELETE ON review_candidates BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+                 CREATE TRIGGER review_resolutions_no_update BEFORE UPDATE ON review_resolutions BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+                 CREATE TRIGGER review_resolutions_no_delete BEFORE DELETE ON review_resolutions BEGIN SELECT RAISE(ABORT, 'append_only'); END;",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        if table_exists(connection, "ledger_checkpoints")? {
+            append_ledger_checkpoint(connection)?;
+        }
+    }
+    connection
+        .execute_batch(
+            "INSERT OR REPLACE INTO schema_migrations(version) VALUES (8);
              COMMIT;",
         )
         .map_err(|_| StoreError::Unavailable)
@@ -1536,9 +2080,9 @@ fn ledger_root(connection: &Connection) -> Result<Vec<u8>, StoreError> {
     const QUERIES: [&str; 7] = [
         "SELECT 'r|'||quote(receivable_id)||'|'||quote(recipient)||'|'||quote(mint)||'|'||quote(atomic_amount)||'|'||quote(decimals)||'|'||quote(reference)||'|'||quote(public_label)||'|'||quote(state)||'|'||quote(created_at_unix_ms)||'|'||quote(solana_pay_url) FROM receivables ORDER BY receivable_id",
         "SELECT 'e|'||quote(sequence)||'|'||quote(receivable_id)||'|'||quote(event_schema_version)||'|'||quote(event_domain)||'|'||quote(hex(previous_event_hash))||'|'||quote(hex(canonical_event_bytes))||'|'||quote(hex(event_hash)) FROM receivable_events ORDER BY sequence",
-        "SELECT 's|'||quote(receivable_id)||'|'||quote(signature)||'|'||quote(reference)||'|'||quote(slot)||'|'||quote(block_time_unix)||'|'||quote(recipient)||'|'||quote(mint)||'|'||quote(atomic_amount)||'|'||quote(instruction_position)||'|'||quote(fingerprint)||'|'||quote(observed_at_unix_ms) FROM settlements ORDER BY receivable_id",
-        "SELECT 'a|'||quote(sequence)||'|'||quote(receivable_id)||'|'||quote(signature)||'|'||quote(slot)||'|'||quote(verdict)||'|'||quote(candidate_fingerprint)||'|'||quote(observed_at_unix_ms) FROM review_candidates ORDER BY sequence",
-        "SELECT 'd|'||quote(candidate_fingerprint)||'|'||quote(receivable_id)||'|'||quote(action)||'|'||quote(resolved_at_unix_ms) FROM review_resolutions ORDER BY candidate_fingerprint",
+        "SELECT 's|'||quote(receivable_id)||'|'||quote(signature)||'|'||quote(reference)||'|'||quote(slot)||'|'||quote(block_time_unix)||'|'||quote(recipient)||'|'||quote(mint)||'|'||quote(atomic_amount)||'|'||quote(instruction_position)||'|'||quote(fingerprint)||'|'||quote(observed_at_unix_ms)||'|'||quote(settlement_kind)||'|'||quote(expected_atomic_amount)||'|'||quote(variance_reason)||'|'||quote(approval_run_id) FROM settlements ORDER BY receivable_id",
+        "SELECT 'a|'||quote(sequence)||'|'||quote(receivable_id)||'|'||quote(signature)||'|'||quote(slot)||'|'||quote(verdict)||'|'||quote(candidate_fingerprint)||'|'||quote(observed_at_unix_ms)||'|'||quote(block_time_unix)||'|'||quote(recipient)||'|'||quote(mint)||'|'||quote(expected_atomic_amount)||'|'||quote(received_atomic_amount)||'|'||quote(shortfall_atomic_amount)||'|'||quote(instruction_position) FROM review_candidates ORDER BY sequence",
+        "SELECT 'd|'||quote(candidate_fingerprint)||'|'||quote(receivable_id)||'|'||quote(action)||'|'||quote(variance_reason)||'|'||quote(approval_run_id)||'|'||quote(resolved_at_unix_ms) FROM review_resolutions ORDER BY candidate_fingerprint",
         "SELECT 'v|'||quote(receivable_id)||'|'||quote(operation_date)||'|'||quote(quote_date)||'|'||quote(purchase)||'|'||quote(sale)||'|'||quote(bulletin_type)||'|'||quote(bulletin_timestamp)||'|'||quote(retrieved_at_unix_ms)||'|'||quote(response_sha256)||'|'||quote(source_id)||'|'||quote(policy_version)||'|'||quote(valuation_method)||'|'||quote(brl_reference_cents) FROM valuations ORDER BY receivable_id",
         "SELECT 'c|'||quote(month)||'|'||quote(revision)||'|'||quote(artifact_kind)||'|'||quote(hex(canonical_json))||'|'||quote(hex(accountant_csv))||'|'||quote(hex(manifest_json))||'|'||quote(hex(close_hash)) FROM month_close_revisions ORDER BY month,revision",
     ];
@@ -1631,6 +2175,7 @@ fn find_in(connection: &Connection, id: &str) -> Result<Option<StoredReceivable>
                 "payment_verified" => ReceivableState::PaymentVerified,
                 "needs_review" => ReceivableState::NeedsReview,
                 "cancelled" => ReceivableState::Cancelled,
+                "settled_with_variance" => ReceivableState::SettledWithVariance,
                 _ => return Err(StoreError::Integrity),
             };
             let generated_url = request
@@ -1926,8 +2471,20 @@ mod tests {
         assert_eq!(
             store.resolve_review(
                 &stored.request.receivable_id,
+                &first_fingerprint,
+                ReviewResolutionAction::AcceptUnderpaymentWithVariance,
+                Some(VarianceReason::MerchantWriteOff),
+                "run-not-eligible",
+                299,
+            ),
+            Err(StoreError::InvalidTransition)
+        );
+        assert_eq!(
+            store.resolve_review(
+                &stored.request.receivable_id,
                 &"cd".repeat(32),
                 ReviewResolutionAction::IgnoreCandidateAndReopen,
+                None,
                 "run-stale",
                 300,
             ),
@@ -1939,6 +2496,7 @@ mod tests {
                     &stored.request.receivable_id,
                     &first_fingerprint,
                     ReviewResolutionAction::IgnoreCandidateAndReopen,
+                    None,
                     "run-reopen",
                     301,
                 )
@@ -1951,6 +2509,7 @@ mod tests {
                     &stored.request.receivable_id,
                     &first_fingerprint,
                     ReviewResolutionAction::IgnoreCandidateAndReopen,
+                    None,
                     "run-reopen",
                     302,
                 )
@@ -1962,6 +2521,7 @@ mod tests {
                 &stored.request.receivable_id,
                 &first_fingerprint,
                 ReviewResolutionAction::CancelUnpaid,
+                None,
                 "run-conflict",
                 303,
             ),
@@ -1991,6 +2551,7 @@ mod tests {
                     &stored.request.receivable_id,
                     &second_fingerprint,
                     ReviewResolutionAction::CancelUnpaid,
+                    None,
                     "run-cancel",
                     500,
                 )
@@ -2041,6 +2602,7 @@ mod tests {
                 &stored.request.receivable_id,
                 &fingerprint,
                 ReviewResolutionAction::CancelUnpaid,
+                None,
                 "run-tamper",
                 300,
             )
@@ -2085,6 +2647,7 @@ mod tests {
                         &id,
                         &fingerprint,
                         ReviewResolutionAction::IgnoreCandidateAndReopen,
+                        None,
                         "run-race",
                         300 + offset,
                     )

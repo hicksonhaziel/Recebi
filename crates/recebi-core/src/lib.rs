@@ -14,15 +14,17 @@ pub mod transaction_decode;
 pub use error::CoreError;
 pub use model::{
     AtomicAmount, BoundedText, GenesisHash, PaymentRequest, Provenance, PublicKey, ReceivableId,
-    ReceivableState, Reference, ReviewResolutionAction,
+    ReceivableState, Reference, ReviewResolutionAction, VarianceReason,
 };
 pub use ptax::{
     NOMINAL_USDC_USD_METHOD, PtaxDate, PtaxDecimal, PtaxEvidence, PtaxQuoteCandidate,
     nominal_brl_reference_cents, select_strict_same_day_quote,
 };
 pub use settlement::{
-    AccountMeta, CompiledInstruction, SettlementEvidence, SettlementExpectation, SettlementVerdict,
-    TokenAccountSnapshot, TransactionSnapshot, verify_settlement, verify_settlement_once,
+    AccountMeta, CompiledInstruction, SettlementAssessment, SettlementEvidence,
+    SettlementExpectation, SettlementVerdict, TokenAccountSnapshot, TransactionSnapshot,
+    UnderpaymentEvidence, assess_settlement, assess_settlement_once, verify_settlement,
+    verify_settlement_once,
 };
 pub use transaction_decode::{
     RawTokenAccount, RawTransaction, TransactionDecodeVerdict, decode_transaction,

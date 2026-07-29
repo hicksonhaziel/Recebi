@@ -72,6 +72,27 @@ pub struct SettlementEvidence {
     pub fingerprint: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnderpaymentEvidence {
+    pub signature: String,
+    pub slot: u64,
+    pub block_time_unix: Option<i64>,
+    pub cluster_genesis_hash: GenesisHash,
+    pub recipient: PublicKey,
+    pub mint: PublicKey,
+    pub expected_amount: AtomicAmount,
+    pub received_amount: AtomicAmount,
+    pub shortfall_amount: AtomicAmount,
+    pub transfer_instruction_position: usize,
+    pub fingerprint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SettlementAssessment {
+    Exact(SettlementEvidence),
+    Underpayment(UnderpaymentEvidence),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettlementVerdict {
     NotFinalized,
@@ -104,13 +125,28 @@ pub enum SettlementVerdict {
 ///
 /// Returns one explicit fail-closed verdict for every rejected snapshot shape.
 ///
-/// # Panics
-///
-/// Panics only if a compile-time Solana program-address constant is malformed.
 pub fn verify_settlement(
     snapshot: &TransactionSnapshot,
     expected: &SettlementExpectation,
 ) -> Result<SettlementEvidence, SettlementVerdict> {
+    match assess_settlement(snapshot, expected)? {
+        SettlementAssessment::Exact(evidence) => Ok(evidence),
+        SettlementAssessment::Underpayment(_) => Err(SettlementVerdict::WrongAmount),
+    }
+}
+
+/// Assesses one canonical transfer while preserving a deterministic
+/// underpayment as structured evidence. An underpayment passes every exact
+/// settlement invariant except amount and can never represent an overpayment,
+/// split transfer, wrong recipient, wrong mint, or unsafe reference.
+///
+/// # Errors
+///
+/// Returns one explicit fail-closed verdict for every rejected snapshot shape.
+pub fn assess_settlement(
+    snapshot: &TransactionSnapshot,
+    expected: &SettlementExpectation,
+) -> Result<SettlementAssessment, SettlementVerdict> {
     if !snapshot.finalized {
         return Err(SettlementVerdict::NotFinalized);
     }
@@ -131,11 +167,13 @@ pub fn verify_settlement(
     {
         return Err(SettlementVerdict::BoundsExceeded);
     }
-    let token_program = PublicKey::parse(CLASSIC_TOKEN_PROGRAM).expect("constant is valid");
-    let token_2022 = PublicKey::parse(TOKEN_2022_PROGRAM).expect("constant is valid");
+    let token_program = PublicKey::parse(CLASSIC_TOKEN_PROGRAM)
+        .map_err(|_| SettlementVerdict::MalformedInstruction)?;
+    let token_2022 = PublicKey::parse(TOKEN_2022_PROGRAM)
+        .map_err(|_| SettlementVerdict::MalformedInstruction)?;
     let merchant_ata = derive_classic_ata(&expected.merchant_wallet, &expected.mint)
         .map_err(|_| SettlementVerdict::WrongRecipient)?;
-    let mut exact: Option<SettlementEvidence> = None;
+    let mut candidate: Option<SettlementEvidence> = None;
     for (position, instruction) in snapshot.instructions.iter().enumerate() {
         if instruction.account_indices.len() > MAX_ACCOUNTS_PER_INSTRUCTION
             || instruction.data.len() > MAX_INSTRUCTION_DATA_BYTES
@@ -159,9 +197,6 @@ pub fn verify_settlement(
         if !reference_ok {
             return Err(SettlementVerdict::MissingReference);
         }
-        if amount != expected.amount {
-            return Err(SettlementVerdict::WrongAmount);
-        }
         let evidence = SettlementEvidence {
             signature: snapshot.signature.clone(),
             slot: snapshot.slot,
@@ -173,14 +208,39 @@ pub fn verify_settlement(
             transfer_instruction_position: position,
             fingerprint: String::new(),
         };
-        if exact.is_some() {
+        if candidate.is_some() {
             return Err(SettlementVerdict::MultipleCandidateTransfers);
         }
-        exact = Some(evidence);
+        candidate = Some(evidence);
     }
-    let mut evidence = exact.ok_or(SettlementVerdict::NoExactTransfer)?;
+    let mut evidence = candidate.ok_or(SettlementVerdict::NoExactTransfer)?;
+    if evidence.amount > expected.amount || evidence.amount.get() == 0 {
+        return Err(SettlementVerdict::WrongAmount);
+    }
+    if evidence.amount < expected.amount {
+        let shortfall = expected
+            .amount
+            .get()
+            .checked_sub(evidence.amount.get())
+            .ok_or(SettlementVerdict::WrongAmount)?;
+        let mut underpayment = UnderpaymentEvidence {
+            signature: evidence.signature,
+            slot: evidence.slot,
+            block_time_unix: evidence.block_time_unix,
+            cluster_genesis_hash: evidence.cluster_genesis_hash,
+            recipient: evidence.recipient,
+            mint: evidence.mint,
+            expected_amount: expected.amount,
+            received_amount: evidence.amount,
+            shortfall_amount: AtomicAmount::new(shortfall),
+            transfer_instruction_position: evidence.transfer_instruction_position,
+            fingerprint: String::new(),
+        };
+        underpayment.fingerprint = underpayment_fingerprint(&underpayment, expected);
+        return Ok(SettlementAssessment::Underpayment(underpayment));
+    }
     evidence.fingerprint = fingerprint(&evidence, expected);
-    Ok(evidence)
+    Ok(SettlementAssessment::Exact(evidence))
 }
 
 /// Applies the same pure verifier with caller-owned replay state. Phase 4 will
@@ -202,6 +262,27 @@ pub fn verify_settlement_once<SignatureHasher: BuildHasher, ReferenceHasher: Bui
         return Err(SettlementVerdict::ReferenceReused);
     }
     verify_settlement(snapshot, expected)
+}
+
+/// Applies replay protection before returning an exact or structured
+/// underpayment assessment.
+///
+/// # Errors
+///
+/// Returns replay or normal settlement verdicts without weakening them.
+pub fn assess_settlement_once<SignatureHasher: BuildHasher, ReferenceHasher: BuildHasher>(
+    snapshot: &TransactionSnapshot,
+    expected: &SettlementExpectation,
+    consumed_signatures: &HashSet<String, SignatureHasher>,
+    consumed_references: &HashSet<Reference, ReferenceHasher>,
+) -> Result<SettlementAssessment, SettlementVerdict> {
+    if consumed_signatures.contains(&snapshot.signature) {
+        return Err(SettlementVerdict::DuplicateSignature);
+    }
+    if consumed_references.contains(&expected.reference) {
+        return Err(SettlementVerdict::ReferenceReused);
+    }
+    assess_settlement(snapshot, expected)
 }
 
 fn key(snapshot: &TransactionSnapshot, index: u8) -> Result<PublicKey, SettlementVerdict> {
@@ -298,6 +379,34 @@ fn fingerprint(evidence: &SettlementEvidence, expected: &SettlementExpectation) 
         evidence.recipient.as_str(),
         evidence.mint.as_str(),
         evidence.amount.get(),
+        expected.reference.as_base58(),
+        evidence.transfer_instruction_position
+    );
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    output
+}
+
+fn underpayment_fingerprint(
+    evidence: &UnderpaymentEvidence,
+    expected: &SettlementExpectation,
+) -> String {
+    let canonical = format!(
+        "v=1|domain=recebi.underpayment|genesis={}|id={}|sig={}|slot={}|time={:?}|recipient={}|mint={}|expected={}|received={}|shortfall={}|reference={}|ix={}",
+        evidence.cluster_genesis_hash.as_str(),
+        expected.receivable_id.as_str(),
+        evidence.signature,
+        evidence.slot,
+        evidence.block_time_unix,
+        evidence.recipient.as_str(),
+        evidence.mint.as_str(),
+        evidence.expected_amount.get(),
+        evidence.received_amount.get(),
+        evidence.shortfall_amount.get(),
         expected.reference.as_base58(),
         evidence.transfer_instruction_position
     );
@@ -597,7 +706,7 @@ mod tests {
         snapshot.instructions.push(snapshot.instructions[0].clone());
         assert_eq!(
             verify_settlement(&snapshot, &expected),
-            Err(SettlementVerdict::WrongAmount)
+            Err(SettlementVerdict::MultipleCandidateTransfers)
         );
 
         let (mut snapshot, expected) = fixture();
@@ -607,6 +716,33 @@ mod tests {
         assert_eq!(
             verify_settlement(&snapshot, &expected),
             Err(SettlementVerdict::WrongRecipient)
+        );
+    }
+
+    #[test]
+    fn exposes_only_one_canonical_underpayment_as_variance_evidence() {
+        let (mut snapshot, expected) = fixture();
+        let received = expected.amount.get() - 1;
+        snapshot.instructions[0].data[1..9].copy_from_slice(&received.to_le_bytes());
+        let assessment = assess_settlement(&snapshot, &expected).expect("assessment");
+        let SettlementAssessment::Underpayment(evidence) = assessment else {
+            panic!("expected underpayment");
+        };
+        assert_eq!(evidence.expected_amount, expected.amount);
+        assert_eq!(evidence.received_amount, AtomicAmount::new(received));
+        assert_eq!(evidence.shortfall_amount, AtomicAmount::new(1));
+        assert_eq!(evidence.fingerprint.len(), 64);
+        assert_eq!(
+            verify_settlement(&snapshot, &expected),
+            Err(SettlementVerdict::WrongAmount)
+        );
+
+        let (mut overpaid, expected) = fixture();
+        let received = expected.amount.get() + 1;
+        overpaid.instructions[0].data[1..9].copy_from_slice(&received.to_le_bytes());
+        assert_eq!(
+            assess_settlement(&overpaid, &expected),
+            Err(SettlementVerdict::WrongAmount)
         );
     }
 

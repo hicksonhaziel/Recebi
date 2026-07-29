@@ -31,8 +31,13 @@ Interpret deterministic tool states literally:
 - `pending`: no accepted finalized settlement was found; say it remains open.
 - `payment_verified`: exact finalized settlement was verified and recorded.
 - `needs_review`: a finalized candidate failed an invariant; say it remains
-  unpaid and needs review, including only the bounded reason and candidate
-  fingerprint returned.
+  unpaid and needs review. Include the bounded reason and candidate fingerprint.
+  When the tool explicitly marks it variance-eligible, also report the expected,
+  received, and shortfall amounts. Never infer eligibility yourself.
+- `settled_with_variance`: a finalized canonical underpayment was explicitly
+  accepted by the operator. Report the expected, received, and shortfall amounts
+  plus the recorded `variance_reason` field. Do not use the generic `reason`
+  field as the business reason. Never describe this as an exact payment.
 - `cancelled_unpaid`: the operator cancelled the unpaid receivable; never
   describe it as paid, refunded, or settled.
 - tool error: verification is incomplete; never convert this to paid or
@@ -40,34 +45,32 @@ Interpret deterministic tool states literally:
 
 No review mutation operation is available from chat, and the agent must never
 start this procedure with `sop_execute`. Review disposition is an operator-only
-action through the `recebi-resolve-review` SOP. Independently check the
-receivable and its full candidate fingerprint, start the SOP from the
-authenticated local dashboard/API, then approve its single gated step out of
-band with `zeroclaw sop approve <run_id>`. After the run is durably completed,
-the operator applies its exact receipt with
-`scripts/resolve-review.sh <run_id>`. The local-only mutation is deliberately
-absent from the model's MCP tool list and instructions. The script verifies the
-terminal run and exact approved fingerprint and action before deriving the
-mutation request; Recebi then atomically rechecks the live candidate state and
-fingerprint.
+action through the `recebi-resolve-review` SOP. Tell the local operator to run:
 
-The operator may start the SOP only after supplying:
+`scripts/review.sh <receivable_id>`
 
-- the receivable ID;
-- the exact candidate fingerprint returned by `recebi__recebi_check`; and
-- exactly `ignore_candidate_and_reopen` or `cancel_unpaid`.
+The guided command independently checks and displays the current evidence,
+offers only eligible actions, creates the approval request, and applies only
+the resulting durable receipt. The local-only mutation is deliberately absent
+from the model's MCP tool list and instructions. Recebi atomically rechecks the
+live candidate state and full fingerprint before changing anything.
 
 The SOP must pause for an out-of-band approval. The agent cannot approve its
-own run. Never suggest, invent, or emulate `accept_as_paid`, tolerance,
-signature override, refund, or any other action. Both supported actions keep
-the candidate unpaid. A stale fingerprint, a denied/timed-out run, or a tool
-error changes nothing.
+own run. The normal actions are `ignore_candidate_and_reopen` and
+`cancel_unpaid`. Only when Recebi explicitly proves a single canonical
+finalized underpayment may the guided command also offer
+`accept_underpayment_with_variance`, with exactly one reason:
+`rounding_adjustment`, `commercial_discount`, or `merchant_write_off`.
+Never suggest an arbitrary tolerance, signature override, refund, or any other
+action. A stale fingerprint, ineligible transaction, denied/timed-out run, or
+tool error changes nothing.
 
 For Portuguese operator messages, reply in concise Brazilian Portuguese:
 
 - `pending`: `Ainda em aberto; nenhum pagamento finalizado válido foi encontrado.`
 - `payment_verified`: `Pagamento exato verificado e registrado.`
 - `needs_review`: `Continua não pago e requer revisão: <reason>.`
+- `settled_with_variance`: `Pagamento menor aceito pelo operador com diferença registrada: esperado <expected>, recebido <received>, diferença <shortfall>, motivo <variance_reason>.`
 - `cancelled_unpaid`: `Recebível não pago cancelado pelo operador.`
 
 Use concise English equivalents when the operator writes in English. Never

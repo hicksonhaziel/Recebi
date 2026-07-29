@@ -14,4 +14,4 @@ pub use payment_request::{PaymentRequest, ReceivableId};
 pub use provenance::Provenance;
 pub use public_key::PublicKey;
 pub use reference::Reference;
-pub use state::{ReceivableState, ReviewResolutionAction};
+pub use state::{ReceivableState, ReviewResolutionAction, VarianceReason};

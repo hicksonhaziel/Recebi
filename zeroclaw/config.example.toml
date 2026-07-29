@@ -18,8 +18,9 @@ servers = ["recebi"]
 # Recebi's review-resolution procedure must be copied to this private runtime
 # directory. The gate is durable across restarts and only the operator can
 # clear its first and only step out of band. The model cannot mutate review
-# state: after a completed run, the operator applies the verified receipt with
-# `scripts/resolve-review.sh <run_id>`.
+# state. Use `scripts/review.sh <receivable_id>` for the guided evidence,
+# disposition, approval, and application flow. `scripts/resolve-review.sh`
+# remains the lower-level receipt verifier used by that command.
 [sop]
 sops_dir = "/absolute/path/to/private-zeroclaw-workspace/sops"
 default_execution_mode = "supervised"

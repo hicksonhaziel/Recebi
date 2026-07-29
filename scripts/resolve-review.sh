@@ -62,21 +62,38 @@ receipt=$(jq -cer --arg run_id "$run_id" '
       and ($run.step_results | length) == 1
       and $run.step_results[0].status == "completed"
     )
-  | ($run.trigger_event.payload | fromjson?) as $trigger
-  | ($run.step_results[0].output | fromjson?) as $approval
+  | (($run.trigger_event.payload | fromjson?)
+     | . + {variance_reason: (.variance_reason // "none")}) as $trigger
+  | (($run.step_results[0].output | fromjson?)
+     | . + {variance_reason: (.variance_reason // "none")}) as $approval
   | select(
       $approval.receivable_id == $trigger.receivable_id
       and $approval.fingerprint == $trigger.candidate_fingerprint
       and $approval.requested_action == $trigger.action
+      and $approval.variance_reason == $trigger.variance_reason
       and $approval.approval_checkpoint == "cleared"
       and ($trigger.candidate_fingerprint | test("^[0-9a-f]{64}$"))
-      and ($trigger.action == "ignore_candidate_and_reopen"
-           or $trigger.action == "cancel_unpaid")
+      and (
+        (($trigger.action == "ignore_candidate_and_reopen"
+          or $trigger.action == "cancel_unpaid")
+         and $trigger.variance_reason == "none")
+        or
+        ($trigger.action == "accept_underpayment_with_variance"
+         and ($trigger.variance_reason == "rounding_adjustment"
+              or $trigger.variance_reason == "commercial_discount"
+              or $trigger.variance_reason == "merchant_write_off"))
+      )
     )
   | {
       receivable_id: $trigger.receivable_id,
       candidate_fingerprint: $trigger.candidate_fingerprint,
       action: $trigger.action,
+      variance_reason: (
+        if $trigger.variance_reason == "none"
+        then null
+        else $trigger.variance_reason
+        end
+      ),
       approval_run_id: $run_id
     }
 ' <<<"$run_json") || {

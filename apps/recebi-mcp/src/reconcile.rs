@@ -6,10 +6,10 @@ use std::{
 
 use getrandom::fill;
 use recebi_core::{
-    ReceivableId, ReceivableState, ReviewResolutionAction, SettlementExpectation,
-    SettlementVerdict, decode_transaction,
+    ReceivableId, ReceivableState, ReviewResolutionAction, SettlementAssessment,
+    SettlementExpectation, SettlementVerdict, UnderpaymentEvidence, VarianceReason,
+    assess_settlement_once, decode_transaction,
     limits::{MAX_ANOMALY_SAMPLES, MAX_RECONCILE_RECEIVABLES},
-    verify_settlement_once,
 };
 use recebi_store::{ReceivableStore, StoreError, StoredReceivable};
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,7 @@ pub struct ResolveReviewInput {
     pub receivable_id: String,
     pub candidate_fingerprint: String,
     pub action: ReviewResolutionAction,
+    pub variance_reason: Option<VarianceReason>,
     pub approval_run_id: String,
 }
 
@@ -51,6 +52,7 @@ pub enum CheckStatus {
     PaymentVerified,
     NeedsReview,
     CancelledUnpaid,
+    SettledWithVariance,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -60,6 +62,11 @@ pub struct CheckResult {
     pub signature: Option<String>,
     pub reason: Option<String>,
     pub candidate_fingerprint: Option<String>,
+    pub expected_amount: Option<String>,
+    pub received_amount: Option<String>,
+    pub shortfall_amount: Option<String>,
+    pub variance_eligible: bool,
+    pub variance_reason: Option<VarianceReason>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -68,6 +75,10 @@ pub struct ResolveReviewResult {
     pub candidate_fingerprint: String,
     pub action: ReviewResolutionAction,
     pub state: ReceivableState,
+    pub variance_reason: Option<VarianceReason>,
+    pub expected_amount: Option<String>,
+    pub received_amount: Option<String>,
+    pub shortfall_amount: Option<String>,
     pub approval_run_id: String,
 }
 
@@ -136,6 +147,9 @@ impl<R: SolanaRpc> ReconciliationService<R> {
         self.check_id(&id)
     }
 
+    #[allow(clippy::too_many_lines)]
+    // Keep every persisted state mapped explicitly to its externally visible
+    // result so a new state cannot silently inherit another state's meaning.
     fn check_id(&self, id: &ReceivableId) -> Result<CheckResult, ReconcileError> {
         let stored = self
             .store
@@ -155,6 +169,11 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                     signature: Some(signature),
                     reason: None,
                     candidate_fingerprint: None,
+                    expected_amount: None,
+                    received_amount: None,
+                    shortfall_amount: None,
+                    variance_eligible: false,
+                    variance_reason: None,
                 });
             }
             ReceivableState::NeedsReview => {
@@ -169,6 +188,20 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                     signature: Some(candidate.signature),
                     reason: Some(candidate.verdict),
                     candidate_fingerprint: Some(candidate.candidate_fingerprint),
+                    expected_amount: candidate
+                        .underpayment
+                        .as_ref()
+                        .map(|evidence| evidence.expected_amount.format(stored.request.decimals)),
+                    received_amount: candidate
+                        .underpayment
+                        .as_ref()
+                        .map(|evidence| evidence.received_amount.format(stored.request.decimals)),
+                    shortfall_amount: candidate
+                        .underpayment
+                        .as_ref()
+                        .map(|evidence| evidence.shortfall_amount.format(stored.request.decimals)),
+                    variance_eligible: candidate.underpayment.is_some(),
+                    variance_reason: None,
                 });
             }
             ReceivableState::Cancelled => {
@@ -178,6 +211,41 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                     signature: None,
                     reason: Some("cancelled_unpaid".to_owned()),
                     candidate_fingerprint: None,
+                    expected_amount: None,
+                    received_amount: None,
+                    shortfall_amount: None,
+                    variance_eligible: false,
+                    variance_reason: None,
+                });
+            }
+            ReceivableState::SettledWithVariance => {
+                let settlement = self
+                    .store
+                    .settlement_summary(id)
+                    .map_err(|error| map_store(&error))?
+                    .ok_or(ReconcileError::StorageUnavailable)?;
+                let shortfall = settlement
+                    .expected_amount
+                    .get()
+                    .checked_sub(settlement.received_amount.get())
+                    .ok_or(ReconcileError::StorageUnavailable)?;
+                return Ok(CheckResult {
+                    receivable_id: id.as_str().to_owned(),
+                    status: CheckStatus::SettledWithVariance,
+                    signature: Some(settlement.signature),
+                    reason: Some("operator_accepted_underpayment".to_owned()),
+                    candidate_fingerprint: None,
+                    expected_amount: Some(
+                        settlement.expected_amount.format(stored.request.decimals),
+                    ),
+                    received_amount: Some(
+                        settlement.received_amount.format(stored.request.decimals),
+                    ),
+                    shortfall_amount: Some(
+                        recebi_core::AtomicAmount::new(shortfall).format(stored.request.decimals),
+                    ),
+                    variance_eligible: false,
+                    variance_reason: settlement.variance_reason,
                 });
             }
             ReceivableState::Open => {}
@@ -244,8 +312,8 @@ impl<R: SolanaRpc> ReconciliationService<R> {
             } else {
                 HashSet::new()
             };
-            match verify_settlement_once(&snapshot, &expected, &signatures, &references) {
-                Ok(evidence) => {
+            match assess_settlement_once(&snapshot, &expected, &signatures, &references) {
+                Ok(SettlementAssessment::Exact(evidence)) => {
                     self.store
                         .mark_payment_verified(
                             &expected.receivable_id,
@@ -260,7 +328,24 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                         signature: Some(evidence.signature),
                         reason: None,
                         candidate_fingerprint: None,
+                        expected_amount: None,
+                        received_amount: None,
+                        shortfall_amount: None,
+                        variance_eligible: false,
+                        variance_reason: None,
                     });
+                }
+                Ok(SettlementAssessment::Underpayment(evidence)) => {
+                    let fingerprint = evidence.fingerprint.clone();
+                    if !resolved_fingerprints.contains(&fingerprint) {
+                        first_anomaly.get_or_insert((
+                            evidence.signature.clone(),
+                            evidence.slot,
+                            "wrong_amount",
+                            fingerprint,
+                            Some(evidence),
+                        ));
+                    }
                 }
                 Err(verdict) => {
                     let verdict = verdict_code(verdict);
@@ -277,21 +362,41 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                             candidate.slot,
                             verdict,
                             fingerprint,
+                            None,
                         ));
                     }
                 }
             }
         }
-        let Some((signature, slot, verdict, candidate_fingerprint)) = first_anomaly else {
+        let Some((signature, slot, verdict, candidate_fingerprint, underpayment)) = first_anomaly
+        else {
             return Ok(pending_result(&stored.request.receivable_id));
         };
-        self.record_anomaly(stored, &signature, slot, verdict, &candidate_fingerprint)?;
+        self.record_anomaly(
+            stored,
+            &signature,
+            slot,
+            verdict,
+            &candidate_fingerprint,
+            underpayment.as_ref(),
+        )?;
         Ok(CheckResult {
             receivable_id: stored.request.receivable_id.as_str().to_owned(),
             status: CheckStatus::NeedsReview,
             signature: Some(signature),
             reason: Some(verdict.to_owned()),
             candidate_fingerprint: Some(candidate_fingerprint),
+            expected_amount: underpayment
+                .as_ref()
+                .map(|evidence| evidence.expected_amount.format(stored.request.decimals)),
+            received_amount: underpayment
+                .as_ref()
+                .map(|evidence| evidence.received_amount.format(stored.request.decimals)),
+            shortfall_amount: underpayment
+                .as_ref()
+                .map(|evidence| evidence.shortfall_amount.format(stored.request.decimals)),
+            variance_eligible: underpayment.is_some(),
+            variance_reason: None,
         })
     }
 
@@ -324,6 +429,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                 &receivable_id,
                 &input.candidate_fingerprint,
                 input.action,
+                input.variance_reason,
                 &input.approval_run_id,
                 now_unix_ms()?,
             )
@@ -331,11 +437,42 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                 StoreError::InvalidTransition => ReconcileError::ReviewConflict,
                 _ => map_store(&error),
             })?;
+        let variance = if state == ReceivableState::SettledWithVariance {
+            self.store
+                .settlement_summary(&receivable_id)
+                .map_err(|error| map_store(&error))?
+        } else {
+            None
+        };
+        let shortfall = variance
+            .as_ref()
+            .map(|summary| {
+                summary
+                    .expected_amount
+                    .get()
+                    .checked_sub(summary.received_amount.get())
+                    .ok_or(ReconcileError::StorageUnavailable)
+            })
+            .transpose()?;
         Ok(ResolveReviewResult {
             receivable_id: receivable_id.as_str().to_owned(),
             candidate_fingerprint: input.candidate_fingerprint,
             action: input.action,
             state,
+            variance_reason: input.variance_reason,
+            expected_amount: variance.as_ref().map(|summary| {
+                summary
+                    .expected_amount
+                    .format(self.config.recebi.token_decimals)
+            }),
+            received_amount: variance.as_ref().map(|summary| {
+                summary
+                    .received_amount
+                    .format(self.config.recebi.token_decimals)
+            }),
+            shortfall_amount: shortfall.map(|amount| {
+                recebi_core::AtomicAmount::new(amount).format(self.config.recebi.token_decimals)
+            }),
             approval_run_id: input.approval_run_id,
         })
     }
@@ -347,17 +484,25 @@ impl<R: SolanaRpc> ReconciliationService<R> {
         slot: u64,
         verdict: &'static str,
         fingerprint: &str,
+        underpayment: Option<&UnderpaymentEvidence>,
     ) -> Result<(), ReconcileError> {
-        self.store
-            .mark_needs_review(
+        let observed_at = now_unix_ms()?;
+        match underpayment {
+            None => self.store.mark_needs_review(
                 &stored.request.receivable_id,
                 signature,
                 slot,
                 verdict,
                 fingerprint,
-                now_unix_ms()?,
-            )
-            .map_err(|error| map_store(&error))
+                observed_at,
+            ),
+            Some(evidence) => self.store.mark_underpayment_review(
+                &stored.request.receivable_id,
+                evidence,
+                observed_at,
+            ),
+        }
+        .map_err(|error| map_store(&error))
     }
 
     pub fn reconcile_open(
@@ -413,6 +558,9 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                     }
                 }
                 CheckStatus::CancelledUnpaid => return Err(ReconcileError::StorageUnavailable),
+                CheckStatus::SettledWithVariance => {
+                    return Err(ReconcileError::StorageUnavailable);
+                }
             }
         }
         Ok(result)
@@ -436,6 +584,11 @@ fn pending_result(receivable_id: &ReceivableId) -> CheckResult {
         signature: None,
         reason: None,
         candidate_fingerprint: None,
+        expected_amount: None,
+        received_amount: None,
+        shortfall_amount: None,
+        variance_eligible: false,
+        variance_reason: None,
     }
 }
 
@@ -801,6 +954,7 @@ max_open_reconcile = 10
                 receivable_id: id.as_str().to_owned(),
                 candidate_fingerprint: fingerprint.clone(),
                 action: ReviewResolutionAction::IgnoreCandidateAndReopen,
+                variance_reason: None,
                 approval_run_id: "run-test-reopen".to_owned(),
             })
             .expect("reopen");
@@ -810,6 +964,7 @@ max_open_reconcile = 10
                 receivable_id: id.as_str().to_owned(),
                 candidate_fingerprint: "cd".repeat(32),
                 action: ReviewResolutionAction::CancelUnpaid,
+                variance_reason: None,
                 approval_run_id: "run-test-stale".to_owned(),
             }),
             Err(ReconcileError::ReviewConflict)
@@ -832,6 +987,7 @@ max_open_reconcile = 10
                 receivable_id: id.as_str().to_owned(),
                 candidate_fingerprint: candidate.candidate_fingerprint.expect("fingerprint"),
                 action: ReviewResolutionAction::CancelUnpaid,
+                variance_reason: None,
                 approval_run_id: "run-test-cancel".to_owned(),
             })
             .expect("cancel");
@@ -842,6 +998,60 @@ max_open_reconcile = 10
             })
             .expect("cancelled check");
         assert_eq!(checked.status, CheckStatus::CancelledUnpaid);
+    }
+
+    #[test]
+    fn operator_can_accept_only_a_canonical_underpayment_as_variance() {
+        let (_directory, service, id) = setup(99_000, false);
+        let candidate = service
+            .check(CheckInput {
+                receivable_id: id.as_str().to_owned(),
+            })
+            .expect("candidate");
+        assert_eq!(candidate.status, CheckStatus::NeedsReview);
+        assert!(candidate.variance_eligible);
+        assert_eq!(candidate.expected_amount.as_deref(), Some("0.1"));
+        assert_eq!(candidate.received_amount.as_deref(), Some("0.099"));
+        assert_eq!(candidate.shortfall_amount.as_deref(), Some("0.001"));
+        let fingerprint = candidate.candidate_fingerprint.expect("fingerprint");
+
+        assert_eq!(
+            service.resolve_review(ResolveReviewInput {
+                receivable_id: id.as_str().to_owned(),
+                candidate_fingerprint: fingerprint.clone(),
+                action: ReviewResolutionAction::AcceptUnderpaymentWithVariance,
+                variance_reason: None,
+                approval_run_id: "run-missing-reason".to_owned(),
+            }),
+            Err(ReconcileError::ReviewConflict)
+        );
+        let accepted = service
+            .resolve_review(ResolveReviewInput {
+                receivable_id: id.as_str().to_owned(),
+                candidate_fingerprint: fingerprint,
+                action: ReviewResolutionAction::AcceptUnderpaymentWithVariance,
+                variance_reason: Some(VarianceReason::MerchantWriteOff),
+                approval_run_id: "run-variance".to_owned(),
+            })
+            .expect("accept variance");
+        assert_eq!(accepted.state, ReceivableState::SettledWithVariance);
+        let checked = service
+            .check(CheckInput {
+                receivable_id: id.as_str().to_owned(),
+            })
+            .expect("settled check");
+        assert_eq!(checked.status, CheckStatus::SettledWithVariance);
+        assert_eq!(
+            checked.reason.as_deref(),
+            Some("operator_accepted_underpayment")
+        );
+        assert_eq!(checked.expected_amount.as_deref(), Some("0.1"));
+        assert_eq!(checked.received_amount.as_deref(), Some("0.099"));
+        assert_eq!(checked.shortfall_amount.as_deref(), Some("0.001"));
+        assert_eq!(
+            checked.variance_reason,
+            Some(VarianceReason::MerchantWriteOff)
+        );
     }
 
     #[test]

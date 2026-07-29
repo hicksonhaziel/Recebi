@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::{config::AppConfig, ptax::PtaxClient};
 
-const EXPORT_SCHEMA: &str = "recebi.monthly_evidence.v1";
+const EXPORT_SCHEMA: &str = "recebi.monthly_evidence.v2";
 const MANIFEST_SCHEMA: &str = "recebi.export_manifest.v1";
 const EXPORT_LEASE_MS: i64 = 10 * 60 * 1_000;
 
@@ -39,6 +39,7 @@ pub struct CloseMonthOutput {
     pub revision: Option<u32>,
     pub month: String,
     pub payment_verified: usize,
+    pub settled_with_variance: usize,
     pub valued: usize,
     pub valuation_pending: usize,
     pub evidence_json_sha256: String,
@@ -243,6 +244,11 @@ impl<P: PtaxClient> CloseMonthService<P> {
             }
         };
         let valued = rows.iter().filter(|row| row.valuation.is_some()).count();
+        let payment_verified = rows
+            .iter()
+            .filter(|row| row.settlement_kind == "exact")
+            .count();
+        let settled_with_variance = rows.len() - payment_verified;
         Ok(CloseMonthOutput {
             status: if mode == ExportMode::FinalClose {
                 "closed"
@@ -252,7 +258,8 @@ impl<P: PtaxClient> CloseMonthService<P> {
             artifact_kind: mode.as_str(),
             revision: (mode == ExportMode::FinalClose).then_some(close.revision),
             month: month.to_owned(),
-            payment_verified: rows.len(),
+            payment_verified,
+            settled_with_variance,
             valued,
             valuation_pending: rows.len() - valued,
             evidence_json_sha256: evidence_hash,
@@ -284,12 +291,9 @@ impl<P: PtaxClient> CloseMonthService<P> {
                 Ok(Some(evidence)) => {
                     let sale = PtaxDecimal::parse(&evidence.sale)
                         .map_err(|_| CloseMonthError::Integrity)?;
-                    let brl_reference_cents = nominal_brl_reference_cents(
-                        row.receivable.request.amount,
-                        self.token_decimals,
-                        sale,
-                    )
-                    .map_err(|_| CloseMonthError::Integrity)?;
+                    let brl_reference_cents =
+                        nominal_brl_reference_cents(row.received_amount, self.token_decimals, sale)
+                            .map_err(|_| CloseMonthError::Integrity)?;
                     self.store
                         .attach_valuation(
                             &row.receivable.request.receivable_id,
@@ -346,6 +350,9 @@ struct EvidenceRecord<'a> {
     payment_status: &'static str,
     valuation_status: &'static str,
     amount_atomic: u64,
+    expected_amount_atomic: u64,
+    received_amount_atomic: u64,
+    shortfall_amount_atomic: u64,
     token_decimals: u8,
     recipient: &'a str,
     mint: &'a str,
@@ -354,6 +361,8 @@ struct EvidenceRecord<'a> {
     slot: u64,
     block_time_unix: i64,
     settlement_fingerprint: &'a str,
+    variance_reason: Option<&'static str>,
+    approval_run_id: Option<&'a str>,
     valuation_pending_reason: Option<ValuationPendingReason>,
     valuation: Option<ValuationEvidence<'a>>,
 }
@@ -375,13 +384,24 @@ fn canonical_evidence(
         .iter()
         .map(|row| EvidenceRecord {
             receivable_id: row.receivable.request.receivable_id.as_str(),
-            payment_status: "verified",
+            payment_status: if row.settlement_kind == "exact" {
+                "exact_verified"
+            } else {
+                "operator_accepted_underpayment"
+            },
             valuation_status: if row.valuation.is_some() {
                 "bcb_verified"
             } else {
                 "pending"
             },
-            amount_atomic: row.receivable.request.amount.get(),
+            amount_atomic: row.received_amount.get(),
+            expected_amount_atomic: row.expected_amount.get(),
+            received_amount_atomic: row.received_amount.get(),
+            shortfall_amount_atomic: row
+                .expected_amount
+                .get()
+                .checked_sub(row.received_amount.get())
+                .unwrap_or_default(),
             token_decimals: row.receivable.request.decimals,
             recipient: row.receivable.request.recipient.as_str(),
             mint: row.receivable.request.mint.as_str(),
@@ -390,6 +410,8 @@ fn canonical_evidence(
             slot: row.slot,
             block_time_unix: row.block_time_unix,
             settlement_fingerprint: &row.settlement_fingerprint,
+            variance_reason: row.variance_reason.map(recebi_core::VarianceReason::as_str),
+            approval_run_id: row.approval_run_id.as_deref(),
             valuation_pending_reason: row.valuation.as_ref().map_or_else(
                 || {
                     pending_reasons
@@ -420,7 +442,7 @@ fn canonical_evidence(
 
 fn accountant_csv(rows: &[StoredSettledReceivable]) -> Vec<u8> {
     let mut csv = String::from(
-        "receivable_id,payment_status,valuation_status,token_amount,operation_date,ptax_purchase,ptax_sale,brl_reference,signature\n",
+        "receivable_id,payment_status,valuation_status,expected_token_amount,received_token_amount,shortfall_token_amount,variance_reason,approval_run_id,operation_date,ptax_purchase,ptax_sale,brl_reference,signature\n",
     );
     for row in rows {
         let operation_date = PtaxDate::from_unix_seconds(row.block_time_unix)
@@ -443,12 +465,23 @@ fn accountant_csv(rows: &[StoredSettledReceivable]) -> Vec<u8> {
         let brl = brl_owned.as_deref().unwrap_or(brl);
         let fields = [
             row.receivable.request.receivable_id.as_str().to_owned(),
-            "verified".to_owned(),
+            if row.settlement_kind == "exact" {
+                "exact_verified".to_owned()
+            } else {
+                "operator_accepted_underpayment".to_owned()
+            },
             status.to_owned(),
-            row.receivable
-                .request
-                .amount
-                .format(row.receivable.request.decimals),
+            row.expected_amount.format(row.receivable.request.decimals),
+            row.received_amount.format(row.receivable.request.decimals),
+            recebi_core::AtomicAmount::new(
+                row.expected_amount
+                    .get()
+                    .saturating_sub(row.received_amount.get()),
+            )
+            .format(row.receivable.request.decimals),
+            row.variance_reason
+                .map_or_else(String::new, |reason| reason.as_str().to_owned()),
+            row.approval_run_id.clone().unwrap_or_default(),
             operation_date,
             purchase.to_owned(),
             sale.to_owned(),
@@ -681,7 +714,8 @@ mod tests {
 
     use recebi_core::{
         AtomicAmount, BoundedText, PaymentRequest, PublicKey, ReceivableId, Reference,
-        SettlementEvidence, limits::MAX_PUBLIC_LABEL_BYTES,
+        ReviewResolutionAction, SettlementEvidence, UnderpaymentEvidence, VarianceReason,
+        limits::MAX_PUBLIC_LABEL_BYTES, solana::derive_classic_ata,
     };
     use recebi_store::ReceivableStore;
 
@@ -760,6 +794,59 @@ max_open_reconcile = 10
                 2,
             )
             .expect("settle");
+        store
+    }
+
+    fn variance_store(config: &AppConfig) -> ReceivableStore {
+        config.ensure_data_directory().expect("data directory");
+        let store = ReceivableStore::open(config.database_path()).expect("store");
+        let request = PaymentRequest {
+            receivable_id: ReceivableId::new("JULY-VARIANCE").expect("id"),
+            recipient: PublicKey::parse("11111111111111111111111111111111").expect("recipient"),
+            mint: PublicKey::parse("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU").expect("mint"),
+            amount: AtomicAmount::new(100_000),
+            decimals: 6,
+            reference: Reference::from_bytes([9; 32]),
+            public_label: BoundedText::<MAX_PUBLIC_LABEL_BYTES>::new("July variance")
+                .expect("label"),
+        };
+        store
+            .create_or_get(request.clone(), 1)
+            .expect("create variance");
+        let recipient = derive_classic_ata(&request.recipient, &request.mint).expect("ATA");
+        let fingerprint = "cd".repeat(32);
+        store
+            .mark_underpayment_review(
+                &request.receivable_id,
+                &UnderpaymentEvidence {
+                    signature: bs58::encode([9; 64]).into_string(),
+                    slot: 100,
+                    block_time_unix: Some(1_753_747_200),
+                    cluster_genesis_hash: recebi_core::GenesisHash::parse(
+                        "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+                    )
+                    .expect("genesis"),
+                    recipient,
+                    mint: request.mint,
+                    expected_amount: request.amount,
+                    received_amount: AtomicAmount::new(99_000),
+                    shortfall_amount: AtomicAmount::new(1_000),
+                    transfer_instruction_position: 1,
+                    fingerprint: fingerprint.clone(),
+                },
+                2,
+            )
+            .expect("underpayment");
+        store
+            .resolve_review(
+                &request.receivable_id,
+                &fingerprint,
+                ReviewResolutionAction::AcceptUnderpaymentWithVariance,
+                Some(VarianceReason::RoundingAdjustment),
+                "run-close-variance",
+                3,
+            )
+            .expect("accept variance");
         store
     }
 
@@ -862,6 +949,37 @@ max_open_reconcile = 10
                 .expect("revision count"),
             2
         );
+    }
+
+    #[test]
+    fn monthly_evidence_keeps_expected_received_and_variance_distinct() {
+        let directory = tempfile::tempdir().expect("dir");
+        let config = config(&directory);
+        variance_store(&config);
+        let service = CloseMonthService::new(
+            &config,
+            FakePtax {
+                result: Arc::new(Mutex::new(Ok(Some(evidence())))),
+            },
+        )
+        .expect("service");
+        let output = service
+            .export_at("2025-07", ExportMode::FinalClose, 1_754_006_400_000)
+            .expect("close");
+        assert_eq!(output.payment_verified, 0);
+        assert_eq!(output.settled_with_variance, 1);
+        let evidence = std::fs::read_to_string(
+            directory
+                .path()
+                .join("data/exports/closed/2025-07/revision-1/recebi-2025-07.evidence.json"),
+        )
+        .expect("evidence");
+        assert!(evidence.contains(r#""payment_status":"operator_accepted_underpayment""#));
+        assert!(evidence.contains(r#""expected_amount_atomic":100000"#));
+        assert!(evidence.contains(r#""received_amount_atomic":99000"#));
+        assert!(evidence.contains(r#""shortfall_amount_atomic":1000"#));
+        assert!(evidence.contains(r#""variance_reason":"rounding_adjustment""#));
+        assert!(evidence.contains(r#""approval_run_id":"run-close-variance""#));
     }
 
     #[test]
