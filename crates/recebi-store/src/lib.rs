@@ -677,6 +677,7 @@ impl ReceivableStore {
         receivable_id: &ReceivableId,
         candidate_fingerprint: &str,
         action: ReviewResolutionAction,
+        approval_run_id: &str,
         resolved_at_unix_ms: i64,
     ) -> Result<ReceivableState, StoreError> {
         self.verify_ledger_integrity()?;
@@ -754,8 +755,8 @@ impl ReceivableStore {
             &transaction,
             receivable_id,
             format!(
-                "event=review_resolved\ncandidate_fingerprint={candidate_fingerprint}\naction={}\nresolved_at_unix_ms={resolved_at_unix_ms}\n",
-                action.as_str()
+                "event=review_resolved\ncandidate_fingerprint={candidate_fingerprint}\naction={}\napproval_run_id={approval_run_id}\nresolved_at_unix_ms={resolved_at_unix_ms}\n",
+                action.as_str(),
             )
             .as_bytes(),
         )?;
@@ -1927,6 +1928,7 @@ mod tests {
                 &stored.request.receivable_id,
                 &"cd".repeat(32),
                 ReviewResolutionAction::IgnoreCandidateAndReopen,
+                "run-stale",
                 300,
             ),
             Err(StoreError::InvalidTransition)
@@ -1937,6 +1939,7 @@ mod tests {
                     &stored.request.receivable_id,
                     &first_fingerprint,
                     ReviewResolutionAction::IgnoreCandidateAndReopen,
+                    "run-reopen",
                     301,
                 )
                 .expect("reopen"),
@@ -1948,6 +1951,7 @@ mod tests {
                     &stored.request.receivable_id,
                     &first_fingerprint,
                     ReviewResolutionAction::IgnoreCandidateAndReopen,
+                    "run-reopen",
                     302,
                 )
                 .expect("idempotent retry"),
@@ -1958,6 +1962,7 @@ mod tests {
                 &stored.request.receivable_id,
                 &first_fingerprint,
                 ReviewResolutionAction::CancelUnpaid,
+                "run-conflict",
                 303,
             ),
             Err(StoreError::InvalidTransition)
@@ -1986,6 +1991,7 @@ mod tests {
                     &stored.request.receivable_id,
                     &second_fingerprint,
                     ReviewResolutionAction::CancelUnpaid,
+                    "run-cancel",
                     500,
                 )
                 .expect("cancel"),
@@ -2035,6 +2041,7 @@ mod tests {
                 &stored.request.receivable_id,
                 &fingerprint,
                 ReviewResolutionAction::CancelUnpaid,
+                "run-tamper",
                 300,
             )
             .expect("resolution");
@@ -2078,6 +2085,7 @@ mod tests {
                         &id,
                         &fingerprint,
                         ReviewResolutionAction::IgnoreCandidateAndReopen,
+                        "run-race",
                         300 + offset,
                     )
                 })

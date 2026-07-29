@@ -16,8 +16,10 @@ servers = ["recebi"]
 # expose the tool on agents that do not need Recebi operational visibility.
 
 # Recebi's review-resolution procedure must be copied to this private runtime
-# directory. The gate is durable across restarts, only the operator can clear
-# it out of band, and timeout cancels the run without changing the receivable.
+# directory. The gate is durable across restarts and only the operator can
+# clear its first and only step out of band. The model cannot mutate review
+# state: after a completed run, the operator applies the verified receipt with
+# `scripts/resolve-review.sh <run_id>`.
 [sop]
 sops_dir = "/absolute/path/to/private-zeroclaw-workspace/sops"
 default_execution_mode = "supervised"
@@ -30,6 +32,7 @@ run_state_dir = "/absolute/path/to/private-zeroclaw-data/sop"
 approval_mode = "out_of_band_required"
 approval_timeout_action = "cancel"
 step_scope_enforce = true
+step_mandatory_tools = []
 step_schema_enforce = true
 max_step_visits = 4
 max_step_retries = 0

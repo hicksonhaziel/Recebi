@@ -131,3 +131,44 @@ are labelled honestly; they are not represented as client or mainnet usage.
 - A Portuguese live check returned
   `Recebível não pago cancelado pelo operador.` An English live check returned
   `Payment verified and recorded.`
+
+## 2026-07-29 — approval boundary correction and fail-closed proof
+
+- Adversarial testing found a stock ZeroClaw 0.8.3 boundary flaw in the initial
+  two-step design: `sop_advance` returned the post-gate step instructions to the
+  same model while the durable run still said `waiting_approval`. The engine
+  later rejected or failed the run, but a model-visible mutation tool could
+  already have produced a side effect. This was observed on self-operated
+  devnet test records only; no signing, submission, refund, or fund movement was
+  available.
+- Recebi now removes review mutation from MCP discovery entirely. Telegram and
+  the model see six tools, none capable of resolving a review. The SOP's first
+  and only step is the out-of-band confirmation and calls no tools.
+- The completed SOP is only an approval receipt. A separate local operator
+  command reads the trusted durable run database, requires an exact terminal
+  `completed` run and matching fingerprint/action receipt, derives the request
+  itself, and invokes the non-discoverable local operation. Recebi atomically
+  rechecks that the same candidate is still the unresolved `needs_review`
+  candidate before changing state.
+- `PHASE6-OPERATOR-001` expected 0.10 devnet USDC and received a deliberate
+  finalized 0.01 mismatch. Signature:
+  `4h1jBZxSL6EJ4kWJkV1Aw6w3bApN1CKjt36U9bJG6PzBAT7hbzopnoMPaQop633NrkhCo8FGSECThsJVr3SZH4wz`.
+  Recebi recorded `wrong_amount` with fingerprint
+  `e248a2c285c84a4ea32df41cd0197ea33d9f4aae9dd4c8c552eac2bb8c70f5e5`.
+- Denied run `run-1785343900191740766-0001` became durably `cancelled`; the
+  operator command refused it and the receivable remained `needs_review`.
+  With a temporary five-second test timeout, run
+  `run-1785343960723504603-0001` also became durably `cancelled` and was
+  refused. Production timeout settings were restored to 300/30 seconds.
+- Approved run `run-1785343991945313520-0001` became durably `completed`.
+  Only then did the local operator command change the record to
+  `cancelled_unpaid`. The hash-chained event includes that exact approval run
+  ID. Replaying the same receipt was idempotent and added no event.
+- A direct `accept_as_paid` injection still failed argument parsing. SQLite
+  integrity returned `ok`; live config/database/SOP files remained mode 0600
+  and private data directories mode 0700.
+- Final correction gates passed: 83 tests, strict all-target/all-feature
+  Clippy, RustSec, cargo-deny advisories/licenses/sources, cargo-machete,
+  locked release build, SOP validation, diff check, and live health. Deployed
+  release SHA-256:
+  `9aba8bf10c7956044445ff9dbe04753ab1ee300122ace0edf61945e3e49f8fe9`.

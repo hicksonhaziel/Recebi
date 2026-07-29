@@ -41,6 +41,7 @@ pub struct ResolveReviewInput {
     pub receivable_id: String,
     pub candidate_fingerprint: String,
     pub action: ReviewResolutionAction,
+    pub approval_run_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -67,6 +68,7 @@ pub struct ResolveReviewResult {
     pub candidate_fingerprint: String,
     pub action: ReviewResolutionAction,
     pub state: ReceivableState,
+    pub approval_run_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -307,12 +309,22 @@ impl<R: SolanaRpc> ReconciliationService<R> {
         {
             return Err(ReconcileError::InvalidInput);
         }
+        if input.approval_run_id.len() > 128
+            || !input.approval_run_id.starts_with("run-")
+            || !input
+                .approval_run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(ReconcileError::InvalidInput);
+        }
         let state = self
             .store
             .resolve_review(
                 &receivable_id,
                 &input.candidate_fingerprint,
                 input.action,
+                &input.approval_run_id,
                 now_unix_ms()?,
             )
             .map_err(|error| match error {
@@ -324,6 +336,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
             candidate_fingerprint: input.candidate_fingerprint,
             action: input.action,
             state,
+            approval_run_id: input.approval_run_id,
         })
     }
 
@@ -788,6 +801,7 @@ max_open_reconcile = 10
                 receivable_id: id.as_str().to_owned(),
                 candidate_fingerprint: fingerprint.clone(),
                 action: ReviewResolutionAction::IgnoreCandidateAndReopen,
+                approval_run_id: "run-test-reopen".to_owned(),
             })
             .expect("reopen");
         assert_eq!(reopened.state, ReceivableState::Open);
@@ -796,6 +810,7 @@ max_open_reconcile = 10
                 receivable_id: id.as_str().to_owned(),
                 candidate_fingerprint: "cd".repeat(32),
                 action: ReviewResolutionAction::CancelUnpaid,
+                approval_run_id: "run-test-stale".to_owned(),
             }),
             Err(ReconcileError::ReviewConflict)
         );
@@ -817,6 +832,7 @@ max_open_reconcile = 10
                 receivable_id: id.as_str().to_owned(),
                 candidate_fingerprint: candidate.candidate_fingerprint.expect("fingerprint"),
                 action: ReviewResolutionAction::CancelUnpaid,
+                approval_run_id: "run-test-cancel".to_owned(),
             })
             .expect("cancel");
         assert_eq!(cancelled.state, ReceivableState::Cancelled);

@@ -38,13 +38,18 @@ Interpret deterministic tool states literally:
 - tool error: verification is incomplete; never convert this to paid or
   needs-review yourself.
 
-Never call `recebi__recebi_resolve_review` or `sop_execute` directly from chat.
-Review disposition is an operator-only action through the
-`recebi-resolve-review` SOP. In ZeroClaw v0.8.3, tell the operator to start the
-SOP from the authenticated local dashboard/API, then approve it out of band
-with `zeroclaw sop approve <run_id>`. The dashboard/API and approval CLI share
-one SOP engine; chat-local `sop_execute` does not reliably expose its live gate
-to the CLI until restart.
+No review mutation operation is available from chat, and the agent must never
+start this procedure with `sop_execute`. Review disposition is an operator-only
+action through the `recebi-resolve-review` SOP. Independently check the
+receivable and its full candidate fingerprint, start the SOP from the
+authenticated local dashboard/API, then approve its single gated step out of
+band with `zeroclaw sop approve <run_id>`. After the run is durably completed,
+the operator applies its exact receipt with
+`scripts/resolve-review.sh <run_id>`. The local-only mutation is deliberately
+absent from the model's MCP tool list and instructions. The script verifies the
+terminal run and exact approved fingerprint and action before deriving the
+mutation request; Recebi then atomically rechecks the live candidate state and
+fingerprint.
 
 The operator may start the SOP only after supplying:
 
