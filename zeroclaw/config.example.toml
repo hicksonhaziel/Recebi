@@ -14,3 +14,26 @@ servers = ["recebi"]
 
 # Add `recebi` to the intended existing agent's `mcp_bundles` list. Do not
 # expose the tool on agents that do not need Recebi operational visibility.
+
+# Recebi's review-resolution procedure must be copied to this private runtime
+# directory. The gate is durable across restarts, only the operator can clear
+# it out of band, and timeout cancels the run without changing the receivable.
+[sop]
+sops_dir = "/absolute/path/to/private-zeroclaw-workspace/sops"
+default_execution_mode = "supervised"
+max_concurrent_total = 1
+approval_timeout_secs = 300
+maintenance_interval_secs = 30
+persist_runs = true
+run_store_backend = "sqlite"
+run_state_dir = "/absolute/path/to/private-zeroclaw-data/sop"
+approval_mode = "out_of_band_required"
+approval_timeout_action = "cancel"
+step_scope_enforce = true
+step_schema_enforce = true
+max_step_visits = 4
+max_step_retries = 0
+untrusted_payload_max_bytes = 1024
+untrusted_input_guard = "block"
+untrusted_outbound_redact = true
+procedural_memory_enabled = false

@@ -9,7 +9,7 @@ use crate::receivable::{CreateRequestInput, ReceivableService};
 use crate::{
     close_month::{CloseMonthInput, CloseMonthService, SnapshotMonthInput},
     ptax::HttpBcbPtax,
-    reconcile::{CheckInput, ReconcileOpenInput, ReconciliationService},
+    reconcile::{CheckInput, ReconcileOpenInput, ReconciliationService, ResolveReviewInput},
     rpc::HttpSolanaRpc,
 };
 
@@ -98,6 +98,7 @@ fn dispatch(
                 create_request_tool_schema(),
                 check_tool_schema(),
                 reconcile_open_tool_schema(),
+                resolve_review_tool_schema(),
                 snapshot_month_tool_schema(),
                 close_month_tool_schema()
             ]}),
@@ -134,10 +135,27 @@ fn call_tool(
         Some("recebi_reconcile_open") => {
             call_reconcile_open(reconciliation, id, params.get("arguments"))
         }
+        Some("recebi_resolve_review") => {
+            call_resolve_review(reconciliation, id, params.get("arguments"))
+        }
         Some("recebi_close_month") => call_close_month(closing, id, params.get("arguments")),
         Some("recebi_snapshot_month") => call_snapshot_month(closing, id, params.get("arguments")),
         _ => error_response(id, -32602, "unknown_tool"),
     }
+}
+
+fn call_resolve_review(
+    reconciliation: &ReconciliationService<HttpSolanaRpc>,
+    id: &Value,
+    arguments: Option<&Value>,
+) -> Value {
+    let Some(arguments) = arguments else {
+        return error_response(id, -32602, "invalid_resolve_review_arguments");
+    };
+    let Ok(input) = serde_json::from_value::<ResolveReviewInput>(arguments.clone()) else {
+        return error_response(id, -32602, "invalid_resolve_review_arguments");
+    };
+    tool_result(id, reconciliation.resolve_review(input))
 }
 
 fn call_snapshot_month(
@@ -363,6 +381,31 @@ fn reconcile_open_tool_schema() -> Value {
     })
 }
 
+fn resolve_review_tool_schema() -> Value {
+    json!({
+        "name": "recebi_resolve_review",
+        "description": "Apply one previously approved disposition to the exact immutable unpaid review candidate. This tool cannot accept, verify, refund, sign, or submit a payment. It must only be called after an out-of-band human approval gate.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "receivable_id": {"type": "string", "maxLength": 64},
+                "candidate_fingerprint": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                    "description": "Exact fingerprint returned by recebi_check for the current unresolved candidate."
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["ignore_candidate_and_reopen", "cancel_unpaid"],
+                    "description": "Both choices preserve the candidate as unpaid. No accept-as-paid action exists."
+                }
+            },
+            "required": ["receivable_id", "candidate_fingerprint", "action"],
+            "additionalProperties": false
+        }
+    })
+}
+
 fn success_response(id: &Value, result: &Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -391,7 +434,7 @@ mod tests {
 
     use super::{
         close_month_tool_schema, create_request_tool_schema, dispatch, encode_response,
-        health_tool_schema, snapshot_month_tool_schema,
+        health_tool_schema, resolve_review_tool_schema, snapshot_month_tool_schema,
     };
     use crate::{
         close_month::CloseMonthService, config::AppConfig, health::HealthService,
@@ -457,6 +500,15 @@ max_open_reconcile = 10
         let snapshot_schema = snapshot_month_tool_schema();
         assert_eq!(snapshot_schema["name"], "recebi_snapshot_month");
         assert_eq!(snapshot_schema["inputSchema"]["required"], json!(["month"]));
+        let resolve_schema = resolve_review_tool_schema();
+        assert_eq!(
+            resolve_schema["inputSchema"]["properties"]["action"]["enum"],
+            json!(["ignore_candidate_and_reopen", "cancel_unpaid"])
+        );
+        assert!(
+            !resolve_schema.to_string().contains("accept_as_paid"),
+            "no paid override may exist"
+        );
     }
 
     #[test]
@@ -507,6 +559,32 @@ max_open_reconcile = 10
         assert_eq!(
             result["error"]["message"],
             "invalid_create_request_arguments"
+        );
+    }
+
+    #[test]
+    fn resolution_rejects_prompt_injected_paid_override() {
+        let (_directory, health, receivables, reconciliation, closing) = services();
+        let result = dispatch(
+            &health,
+            &receivables,
+            &reconciliation,
+            &closing,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "recebi_resolve_review",
+                    "arguments": {
+                        "receivable_id": "ACME-412",
+                        "candidate_fingerprint": "ab".repeat(32),
+                        "action": "accept_as_paid"
+                    }
+                },
+            }),
+        );
+        assert_eq!(
+            result["error"]["message"],
+            "invalid_resolve_review_arguments"
         );
     }
 

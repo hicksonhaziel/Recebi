@@ -96,3 +96,38 @@ are labelled honestly; they are not represented as client or mainnet usage.
   `d8c966bcb04f6b05188cf3ee913029438e114f8c4d2271e220455706b5a418ae`,
   and
   `cef5607686de502a990d68fe8252acfd56702eba75d5f73608163b5dc897df32`.
+
+## 2026-07-29 — approval-gated unpaid anomaly disposition
+
+- Environment: self-operated Solana devnet; locally built Recebi; stock
+  ZeroClaw 0.8.3; `gpt-5.6-luna`. This is builder-operated test evidence, not
+  client or mainnet activity.
+- Recebi added only two operator-approved review outcomes:
+  `ignore_candidate_and_reopen` and `cancel_unpaid`. Neither outcome can mark a
+  payment verified.
+- The existing wrong-amount candidate on `PHASE4-WRONG-002` was inspected,
+  fingerprint-bound, and reopened through a durable out-of-band approval SOP.
+  Its old finalized 0.01 transaction stayed ignored. The isolated devnet payer
+  then sent the exact requested 0.10 USDC using the original reference.
+  Recebi verified only the later finalized signature:
+  `3VbwpV5MgFR6bJM4oRrNibVe3tqqNydjcmd3A9FZzzjvC3jjfqqGWFon9XDuzRpSNzmNgBRPgFwztBMZGMroZkTT`.
+- `PHASE6-CANCEL-001` and `PHASE6-API-001` each expected 0.10 USDC and received
+  a deliberate finalized 0.01 mismatch. Both were subsequently dispositioned
+  as `cancel_unpaid` and now return `cancelled_unpaid`; no settlement row was
+  created.
+- The production SOP path starts through ZeroClaw's authenticated local
+  dashboard/API and pauses before the mutation step. Run
+  `run-1785341983660726113-0001` appeared immediately in
+  `zeroclaw sop pending`, resumed only after
+  `zeroclaw sop approve`, and completed with `state: cancelled`.
+- A stock ZeroClaw 0.8.3 issue was observed and preserved honestly:
+  chat-local `sop_execute` runs use a different live engine from the gateway
+  out-of-band approval surface until restart. Recebi therefore forbids that
+  launch path and uses the shared authenticated dashboard/API engine.
+- After repeated daemon restarts, Telegram, channels, gateway, scheduler, and
+  daemon health were all `ok`. The existing 15-minute, memory-disabled,
+  single-tool cron ran at `2026-07-29T16:15:27Z` and returned a bounded
+  seven-record scan with no anomalies.
+- A Portuguese live check returned
+  `Recebível não pago cancelado pelo operador.` An English live check returned
+  `Payment verified and recorded.`

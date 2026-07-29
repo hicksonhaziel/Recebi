@@ -14,7 +14,7 @@ pub mod transaction_decode;
 pub use error::CoreError;
 pub use model::{
     AtomicAmount, BoundedText, GenesisHash, PaymentRequest, Provenance, PublicKey, ReceivableId,
-    ReceivableState, Reference,
+    ReceivableState, Reference, ReviewResolutionAction,
 };
 pub use ptax::{
     NOMINAL_USDC_USD_METHOD, PtaxDate, PtaxDecimal, PtaxEvidence, PtaxQuoteCandidate,

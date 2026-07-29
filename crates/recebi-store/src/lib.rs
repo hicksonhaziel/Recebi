@@ -6,7 +6,8 @@ use std::{
 
 use recebi_core::{
     AtomicAmount, BoundedText, NOMINAL_USDC_USD_METHOD, PaymentRequest, PtaxDate, PtaxEvidence,
-    PublicKey, ReceivableId, ReceivableState, Reference, SettlementEvidence,
+    PublicKey, ReceivableId, ReceivableState, Reference, ReviewResolutionAction,
+    SettlementEvidence,
     limits::{MAX_MONTH_EXPORT_ROWS, MAX_PUBLIC_LABEL_BYTES},
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -50,6 +51,7 @@ pub struct StoredReceivable {
 pub struct StoredReviewCandidate {
     pub signature: String,
     pub verdict: String,
+    pub candidate_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,7 +106,7 @@ impl ReceivableStore {
                  decimals INTEGER NOT NULL,
                  reference TEXT NOT NULL UNIQUE,
                  public_label TEXT NOT NULL,
-                 state TEXT NOT NULL CHECK(state IN ('open','payment_verified','needs_review')),
+                 state TEXT NOT NULL CHECK(state IN ('open','payment_verified','needs_review','cancelled')),
                  created_at_unix_ms INTEGER NOT NULL,
                  solana_pay_url TEXT NOT NULL
              );
@@ -133,13 +135,24 @@ impl ReceivableStore {
                  observed_at_unix_ms INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS review_candidates (
-                 receivable_id TEXT PRIMARY KEY NOT NULL,
+                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                 receivable_id TEXT NOT NULL,
                  signature TEXT NOT NULL,
                  slot INTEGER NOT NULL,
                  verdict TEXT NOT NULL,
                  candidate_fingerprint TEXT NOT NULL UNIQUE,
                  observed_at_unix_ms INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS review_resolutions (
+                 candidate_fingerprint TEXT PRIMARY KEY NOT NULL,
+                 receivable_id TEXT NOT NULL,
+                 action TEXT NOT NULL CHECK(action IN ('ignore_candidate_and_reopen','cancel_unpaid')),
+                 resolved_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE TRIGGER IF NOT EXISTS review_candidates_no_update BEFORE UPDATE ON review_candidates BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS review_candidates_no_delete BEFORE DELETE ON review_candidates BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS review_resolutions_no_update BEFORE UPDATE ON review_resolutions BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS review_resolutions_no_delete BEFORE DELETE ON review_resolutions BEGIN SELECT RAISE(ABORT, 'append_only'); END;
              CREATE TABLE IF NOT EXISTS reconciliation_lease (
                  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                  owner TEXT NOT NULL,
@@ -195,6 +208,7 @@ impl ReceivableStore {
         ).map_err(|_| StoreError::Unavailable)?;
         migrate_state_constraint(&connection)?;
         migrate_phase_five_schema(&connection)?;
+        migrate_phase_six_schema(&connection)?;
         initialize_ledger_checkpoints(&connection)?;
         secure_file(&store.path)?;
         Ok(store)
@@ -609,17 +623,145 @@ impl ReceivableStore {
         self.verify_ledger_integrity()?;
         self.connection()?
             .query_row(
-                "SELECT signature,verdict FROM review_candidates WHERE receivable_id = ?1",
+                "SELECT c.signature,c.verdict,c.candidate_fingerprint
+                 FROM review_candidates c
+                 LEFT JOIN review_resolutions r USING(candidate_fingerprint)
+                 WHERE c.receivable_id = ?1 AND r.candidate_fingerprint IS NULL
+                 ORDER BY c.sequence DESC LIMIT 1",
                 [receivable_id.as_str()],
                 |row| {
                     Ok(StoredReviewCandidate {
                         signature: row.get(0)?,
                         verdict: row.get(1)?,
+                        candidate_fingerprint: row.get(2)?,
                     })
                 },
             )
             .optional()
             .map_err(|_| StoreError::Unavailable)
+    }
+
+    /// Returns the immutable candidate fingerprints already dispositioned for
+    /// one receivable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted storage or integrity error.
+    pub fn resolved_review_fingerprints(
+        &self,
+        receivable_id: &ReceivableId,
+    ) -> Result<Vec<String>, StoreError> {
+        self.verify_ledger_integrity()?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT candidate_fingerprint FROM review_resolutions
+                 WHERE receivable_id=?1 ORDER BY candidate_fingerprint",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        statement
+            .query_map([receivable_id.as_str()], |row| row.get(0))
+            .map_err(|_| StoreError::Unavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::Unavailable)
+    }
+
+    /// Records one approved unpaid-candidate disposition atomically.
+    ///
+    /// # Errors
+    ///
+    /// A stale fingerprint, unsupported state, conflicting retry, integrity
+    /// failure, or storage failure fails closed.
+    pub fn resolve_review(
+        &self,
+        receivable_id: &ReceivableId,
+        candidate_fingerprint: &str,
+        action: ReviewResolutionAction,
+        resolved_at_unix_ms: i64,
+    ) -> Result<ReceivableState, StoreError> {
+        self.verify_ledger_integrity()?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Unavailable)?;
+        let existing: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT receivable_id,action FROM review_resolutions
+                 WHERE candidate_fingerprint=?1",
+                [candidate_fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?;
+        let target_state = match action {
+            ReviewResolutionAction::IgnoreCandidateAndReopen => ReceivableState::Open,
+            ReviewResolutionAction::CancelUnpaid => ReceivableState::Cancelled,
+        };
+        if let Some((existing_id, existing_action)) = existing {
+            return if existing_id == receivable_id.as_str() && existing_action == action.as_str() {
+                transaction.commit().map_err(|_| StoreError::Unavailable)?;
+                Ok(target_state)
+            } else {
+                Err(StoreError::InvalidTransition)
+            };
+        }
+        let current: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT r.state,c.candidate_fingerprint
+                 FROM receivables r JOIN review_candidates c USING(receivable_id)
+                 LEFT JOIN review_resolutions d USING(candidate_fingerprint)
+                 WHERE r.receivable_id=?1 AND d.candidate_fingerprint IS NULL
+                 ORDER BY c.sequence DESC LIMIT 1",
+                [receivable_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?;
+        if !current.as_ref().is_some_and(|(state, fingerprint)| {
+            state == "needs_review" && fingerprint == candidate_fingerprint
+        }) {
+            return Err(StoreError::InvalidTransition);
+        }
+        transaction
+            .execute(
+                "INSERT INTO review_resolutions (
+                    candidate_fingerprint,receivable_id,action,resolved_at_unix_ms
+                 ) VALUES (?1,?2,?3,?4)",
+                params![
+                    candidate_fingerprint,
+                    receivable_id.as_str(),
+                    action.as_str(),
+                    resolved_at_unix_ms
+                ],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        let state = match target_state {
+            ReceivableState::Open => "open",
+            ReceivableState::Cancelled => "cancelled",
+            _ => return Err(StoreError::Integrity),
+        };
+        let changed = transaction
+            .execute(
+                "UPDATE receivables SET state=?1
+                 WHERE receivable_id=?2 AND state='needs_review'",
+                params![state, receivable_id.as_str()],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        if changed != 1 {
+            return Err(StoreError::InvalidTransition);
+        }
+        append_event(
+            &transaction,
+            receivable_id,
+            format!(
+                "event=review_resolved\ncandidate_fingerprint={candidate_fingerprint}\naction={}\nresolved_at_unix_ms={resolved_at_unix_ms}\n",
+                action.as_str()
+            )
+            .as_bytes(),
+        )?;
+        append_ledger_checkpoint(&transaction)?;
+        transaction.commit().map_err(|_| StoreError::Unavailable)?;
+        Ok(target_state)
     }
 
     /// Attaches immutable valuation evidence to an already verified payment.
@@ -1198,6 +1340,108 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<b
     Ok(names.iter().any(|name| name == column))
 }
 
+fn migrate_phase_six_schema(connection: &Connection) -> Result<(), StoreError> {
+    let installed = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version=7",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| StoreError::Unavailable)?
+        .is_some();
+    if installed {
+        return Ok(());
+    }
+    let checkpoints_installed = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version=5",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| StoreError::Unavailable)?
+        .is_some();
+    connection
+        .execute_batch("BEGIN IMMEDIATE;")
+        .map_err(|_| StoreError::Unavailable)?;
+    if !column_exists(connection, "review_candidates", "sequence")? {
+        connection
+            .execute_batch(
+                "ALTER TABLE review_candidates RENAME TO review_candidates_phase5;
+                 CREATE TABLE review_candidates (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    receivable_id TEXT NOT NULL,
+                    signature TEXT NOT NULL,
+                    slot INTEGER NOT NULL,
+                    verdict TEXT NOT NULL,
+                    candidate_fingerprint TEXT NOT NULL UNIQUE,
+                    observed_at_unix_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO review_candidates (
+                    receivable_id,signature,slot,verdict,candidate_fingerprint,
+                    observed_at_unix_ms
+                 )
+                 SELECT receivable_id,signature,slot,verdict,candidate_fingerprint,
+                        observed_at_unix_ms
+                 FROM review_candidates_phase5;
+                 DROP TABLE review_candidates_phase5;",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+    }
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS review_resolutions (
+                candidate_fingerprint TEXT PRIMARY KEY NOT NULL,
+                receivable_id TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('ignore_candidate_and_reopen','cancel_unpaid')),
+                resolved_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE TRIGGER IF NOT EXISTS review_candidates_no_update BEFORE UPDATE ON review_candidates BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS review_candidates_no_delete BEFORE DELETE ON review_candidates BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS review_resolutions_no_update BEFORE UPDATE ON review_resolutions BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS review_resolutions_no_delete BEFORE DELETE ON review_resolutions BEGIN SELECT RAISE(ABORT, 'append_only'); END;",
+        )
+        .map_err(|_| StoreError::Unavailable)?;
+    let receivables_schema: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='receivables'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StoreError::Unavailable)?;
+    if !receivables_schema.contains("'cancelled'") {
+        connection
+            .execute_batch(
+                "ALTER TABLE receivables RENAME TO receivables_phase5;
+                 CREATE TABLE receivables (
+                    receivable_id TEXT PRIMARY KEY NOT NULL,
+                    recipient TEXT NOT NULL,
+                    mint TEXT NOT NULL,
+                    atomic_amount INTEGER NOT NULL,
+                    decimals INTEGER NOT NULL,
+                    reference TEXT NOT NULL UNIQUE,
+                    public_label TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('open','payment_verified','needs_review','cancelled')),
+                    created_at_unix_ms INTEGER NOT NULL,
+                    solana_pay_url TEXT NOT NULL
+                 );
+                 INSERT INTO receivables SELECT * FROM receivables_phase5;
+                 DROP TABLE receivables_phase5;",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+    }
+    if checkpoints_installed {
+        append_ledger_checkpoint(connection)?;
+    }
+    connection
+        .execute_batch(
+            "INSERT INTO schema_migrations(version) VALUES (7);
+             COMMIT;",
+        )
+        .map_err(|_| StoreError::Unavailable)
+}
+
 fn initialize_ledger_checkpoints(connection: &Connection) -> Result<(), StoreError> {
     let installed = connection
         .query_row(
@@ -1288,11 +1532,12 @@ fn checkpoint_hash(previous: Option<&[u8]>, root: &[u8]) -> Vec<u8> {
 }
 
 fn ledger_root(connection: &Connection) -> Result<Vec<u8>, StoreError> {
-    const QUERIES: [&str; 6] = [
+    const QUERIES: [&str; 7] = [
         "SELECT 'r|'||quote(receivable_id)||'|'||quote(recipient)||'|'||quote(mint)||'|'||quote(atomic_amount)||'|'||quote(decimals)||'|'||quote(reference)||'|'||quote(public_label)||'|'||quote(state)||'|'||quote(created_at_unix_ms)||'|'||quote(solana_pay_url) FROM receivables ORDER BY receivable_id",
         "SELECT 'e|'||quote(sequence)||'|'||quote(receivable_id)||'|'||quote(event_schema_version)||'|'||quote(event_domain)||'|'||quote(hex(previous_event_hash))||'|'||quote(hex(canonical_event_bytes))||'|'||quote(hex(event_hash)) FROM receivable_events ORDER BY sequence",
         "SELECT 's|'||quote(receivable_id)||'|'||quote(signature)||'|'||quote(reference)||'|'||quote(slot)||'|'||quote(block_time_unix)||'|'||quote(recipient)||'|'||quote(mint)||'|'||quote(atomic_amount)||'|'||quote(instruction_position)||'|'||quote(fingerprint)||'|'||quote(observed_at_unix_ms) FROM settlements ORDER BY receivable_id",
-        "SELECT 'a|'||quote(receivable_id)||'|'||quote(signature)||'|'||quote(slot)||'|'||quote(verdict)||'|'||quote(candidate_fingerprint)||'|'||quote(observed_at_unix_ms) FROM review_candidates ORDER BY receivable_id",
+        "SELECT 'a|'||quote(sequence)||'|'||quote(receivable_id)||'|'||quote(signature)||'|'||quote(slot)||'|'||quote(verdict)||'|'||quote(candidate_fingerprint)||'|'||quote(observed_at_unix_ms) FROM review_candidates ORDER BY sequence",
+        "SELECT 'd|'||quote(candidate_fingerprint)||'|'||quote(receivable_id)||'|'||quote(action)||'|'||quote(resolved_at_unix_ms) FROM review_resolutions ORDER BY candidate_fingerprint",
         "SELECT 'v|'||quote(receivable_id)||'|'||quote(operation_date)||'|'||quote(quote_date)||'|'||quote(purchase)||'|'||quote(sale)||'|'||quote(bulletin_type)||'|'||quote(bulletin_timestamp)||'|'||quote(retrieved_at_unix_ms)||'|'||quote(response_sha256)||'|'||quote(source_id)||'|'||quote(policy_version)||'|'||quote(valuation_method)||'|'||quote(brl_reference_cents) FROM valuations ORDER BY receivable_id",
         "SELECT 'c|'||quote(month)||'|'||quote(revision)||'|'||quote(artifact_kind)||'|'||quote(hex(canonical_json))||'|'||quote(hex(accountant_csv))||'|'||quote(hex(manifest_json))||'|'||quote(hex(close_hash)) FROM month_close_revisions ORDER BY month,revision",
     ];
@@ -1350,7 +1595,7 @@ fn migrate_state_constraint(connection: &Connection) -> Result<(), StoreError> {
                  decimals INTEGER NOT NULL,
                  reference TEXT NOT NULL UNIQUE,
                  public_label TEXT NOT NULL,
-                 state TEXT NOT NULL CHECK(state IN ('open','payment_verified','needs_review')),
+                 state TEXT NOT NULL CHECK(state IN ('open','payment_verified','needs_review','cancelled')),
                  created_at_unix_ms INTEGER NOT NULL,
                  solana_pay_url TEXT NOT NULL
              );
@@ -1384,6 +1629,7 @@ fn find_in(connection: &Connection, id: &str) -> Result<Option<StoredReceivable>
                 "open" => ReceivableState::Open,
                 "payment_verified" => ReceivableState::PaymentVerified,
                 "needs_review" => ReceivableState::NeedsReview,
+                "cancelled" => ReceivableState::Cancelled,
                 _ => return Err(StoreError::Integrity),
             };
             let generated_url = request
@@ -1655,6 +1901,276 @@ mod tests {
             ReceivableState::Open
         );
         reopened.verify_event_chain().expect("chain");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One lifecycle test documents both permitted outcomes.
+    fn review_resolution_is_fingerprint_bound_idempotent_and_never_marks_paid() {
+        let directory = tempfile::tempdir().expect("dir");
+        let store = ReceivableStore::open(directory.path().join("recebi.sqlite3")).expect("store");
+        let stored = store
+            .create_or_get(request("REVIEW", 7), 100)
+            .expect("create");
+        let first_fingerprint = "ab".repeat(32);
+        store
+            .mark_needs_review(
+                &stored.request.receivable_id,
+                &bs58::encode([8_u8; 64]).into_string(),
+                101,
+                "wrong_amount",
+                &first_fingerprint,
+                200,
+            )
+            .expect("first candidate");
+        assert_eq!(
+            store.resolve_review(
+                &stored.request.receivable_id,
+                &"cd".repeat(32),
+                ReviewResolutionAction::IgnoreCandidateAndReopen,
+                300,
+            ),
+            Err(StoreError::InvalidTransition)
+        );
+        assert_eq!(
+            store
+                .resolve_review(
+                    &stored.request.receivable_id,
+                    &first_fingerprint,
+                    ReviewResolutionAction::IgnoreCandidateAndReopen,
+                    301,
+                )
+                .expect("reopen"),
+            ReceivableState::Open
+        );
+        assert_eq!(
+            store
+                .resolve_review(
+                    &stored.request.receivable_id,
+                    &first_fingerprint,
+                    ReviewResolutionAction::IgnoreCandidateAndReopen,
+                    302,
+                )
+                .expect("idempotent retry"),
+            ReceivableState::Open
+        );
+        assert_eq!(
+            store.resolve_review(
+                &stored.request.receivable_id,
+                &first_fingerprint,
+                ReviewResolutionAction::CancelUnpaid,
+                303,
+            ),
+            Err(StoreError::InvalidTransition)
+        );
+        assert_eq!(
+            store
+                .review_candidate(&stored.request.receivable_id)
+                .expect("resolved candidate"),
+            None
+        );
+
+        let second_fingerprint = "ef".repeat(32);
+        store
+            .mark_needs_review(
+                &stored.request.receivable_id,
+                &bs58::encode([9_u8; 64]).into_string(),
+                102,
+                "wrong_recipient",
+                &second_fingerprint,
+                400,
+            )
+            .expect("second candidate");
+        assert_eq!(
+            store
+                .resolve_review(
+                    &stored.request.receivable_id,
+                    &second_fingerprint,
+                    ReviewResolutionAction::CancelUnpaid,
+                    500,
+                )
+                .expect("cancel"),
+            ReceivableState::Cancelled
+        );
+        assert_eq!(
+            store
+                .get(&stored.request.receivable_id)
+                .expect("get")
+                .expect("record")
+                .state,
+            ReceivableState::Cancelled
+        );
+        assert_eq!(
+            store.mark_payment_verified(
+                &stored.request.receivable_id,
+                &stored.request.reference,
+                &evidence(&stored.request, 10),
+                600,
+            ),
+            Err(StoreError::InvalidTransition)
+        );
+        store.verify_ledger_integrity().expect("ledger");
+    }
+
+    #[test]
+    fn review_resolution_material_tampering_is_detected() {
+        let directory = tempfile::tempdir().expect("dir");
+        let path = directory.path().join("recebi.sqlite3");
+        let store = ReceivableStore::open(&path).expect("store");
+        let stored = store
+            .create_or_get(request("REVIEW-TAMPER", 7), 100)
+            .expect("create");
+        let fingerprint = "ab".repeat(32);
+        store
+            .mark_needs_review(
+                &stored.request.receivable_id,
+                &bs58::encode([8_u8; 64]).into_string(),
+                101,
+                "wrong_amount",
+                &fingerprint,
+                200,
+            )
+            .expect("candidate");
+        store
+            .resolve_review(
+                &stored.request.receivable_id,
+                &fingerprint,
+                ReviewResolutionAction::CancelUnpaid,
+                300,
+            )
+            .expect("resolution");
+        Connection::open(&path)
+            .expect("connection")
+            .execute_batch(
+                "DROP TRIGGER review_resolutions_no_update;
+                 UPDATE review_resolutions SET action='ignore_candidate_and_reopen';",
+            )
+            .expect("tamper");
+        assert_eq!(store.verify_ledger_integrity(), Err(StoreError::Integrity));
+    }
+
+    #[test]
+    fn concurrent_identical_review_resolution_commits_once_and_is_idempotent() {
+        let directory = tempfile::tempdir().expect("dir");
+        let store = Arc::new(
+            ReceivableStore::open(directory.path().join("recebi.sqlite3")).expect("store"),
+        );
+        let stored = store
+            .create_or_get(request("REVIEW-RACE", 7), 100)
+            .expect("create");
+        let fingerprint = "ab".repeat(32);
+        store
+            .mark_needs_review(
+                &stored.request.receivable_id,
+                &bs58::encode([8_u8; 64]).into_string(),
+                101,
+                "wrong_amount",
+                &fingerprint,
+                200,
+            )
+            .expect("candidate");
+        let handles = (0..4)
+            .map(|offset| {
+                let store = Arc::clone(&store);
+                let id = stored.request.receivable_id.clone();
+                let fingerprint = fingerprint.clone();
+                thread::spawn(move || {
+                    store.resolve_review(
+                        &id,
+                        &fingerprint,
+                        ReviewResolutionAction::IgnoreCandidateAndReopen,
+                        300 + offset,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            assert_eq!(
+                handle.join().expect("thread").expect("idempotent"),
+                ReceivableState::Open
+            );
+        }
+        let connection = store.connection().expect("connection");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM review_resolutions", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("resolution count"),
+            1
+        );
+        store.verify_ledger_integrity().expect("ledger");
+    }
+
+    #[test]
+    fn phase_six_migration_preserves_existing_review_candidate_once() {
+        let directory = tempfile::tempdir().expect("dir");
+        let path = directory.path().join("recebi.sqlite3");
+        let store = ReceivableStore::open(&path).expect("store");
+        let stored = store
+            .create_or_get(request("REVIEW-MIGRATE", 7), 100)
+            .expect("create");
+        let fingerprint = "ab".repeat(32);
+        store
+            .mark_needs_review(
+                &stored.request.receivable_id,
+                &bs58::encode([8_u8; 64]).into_string(),
+                101,
+                "wrong_amount",
+                &fingerprint,
+                200,
+            )
+            .expect("candidate");
+        drop(store);
+        let connection = Connection::open(&path).expect("connection");
+        connection
+            .execute_batch(
+                "DELETE FROM schema_migrations WHERE version=7;
+                 DROP TRIGGER review_candidates_no_update;
+                 DROP TRIGGER review_candidates_no_delete;
+                 DROP TRIGGER review_resolutions_no_update;
+                 DROP TRIGGER review_resolutions_no_delete;
+                 DROP TABLE review_resolutions;
+                 ALTER TABLE review_candidates RENAME TO review_candidates_phase6;
+                 CREATE TABLE review_candidates (
+                    receivable_id TEXT PRIMARY KEY NOT NULL,
+                    signature TEXT NOT NULL,
+                    slot INTEGER NOT NULL,
+                    verdict TEXT NOT NULL,
+                    candidate_fingerprint TEXT NOT NULL UNIQUE,
+                    observed_at_unix_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO review_candidates (
+                    receivable_id,signature,slot,verdict,candidate_fingerprint,
+                    observed_at_unix_ms
+                 )
+                 SELECT receivable_id,signature,slot,verdict,candidate_fingerprint,
+                        observed_at_unix_ms
+                 FROM review_candidates_phase6;
+                 DROP TABLE review_candidates_phase6;",
+            )
+            .expect("simulate phase-five schema");
+        drop(connection);
+
+        let migrated = ReceivableStore::open(&path).expect("migrate");
+        ReceivableStore::open(&path).expect("idempotent reopen");
+        let candidate = migrated
+            .review_candidate(&stored.request.receivable_id)
+            .expect("candidate")
+            .expect("preserved");
+        assert_eq!(candidate.candidate_fingerprint, fingerprint);
+        let connection = Connection::open(&path).expect("connection");
+        assert!(column_exists(&connection, "review_candidates", "sequence").expect("sequence"));
+        assert!(table_exists(&connection, "review_resolutions").expect("resolutions"));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version=7",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("version"),
+            1
+        );
+        migrated.verify_ledger_integrity().expect("ledger");
     }
 
     #[test]

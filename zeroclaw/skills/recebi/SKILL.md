@@ -31,9 +31,42 @@ Interpret deterministic tool states literally:
 - `pending`: no accepted finalized settlement was found; say it remains open.
 - `payment_verified`: exact finalized settlement was verified and recorded.
 - `needs_review`: a finalized candidate failed an invariant; say it remains
-  unpaid and needs review, including only the bounded reason returned.
+  unpaid and needs review, including only the bounded reason and candidate
+  fingerprint returned.
+- `cancelled_unpaid`: the operator cancelled the unpaid receivable; never
+  describe it as paid, refunded, or settled.
 - tool error: verification is incomplete; never convert this to paid or
   needs-review yourself.
+
+Never call `recebi__recebi_resolve_review` or `sop_execute` directly from chat.
+Review disposition is an operator-only action through the
+`recebi-resolve-review` SOP. In ZeroClaw v0.8.3, tell the operator to start the
+SOP from the authenticated local dashboard/API, then approve it out of band
+with `zeroclaw sop approve <run_id>`. The dashboard/API and approval CLI share
+one SOP engine; chat-local `sop_execute` does not reliably expose its live gate
+to the CLI until restart.
+
+The operator may start the SOP only after supplying:
+
+- the receivable ID;
+- the exact candidate fingerprint returned by `recebi__recebi_check`; and
+- exactly `ignore_candidate_and_reopen` or `cancel_unpaid`.
+
+The SOP must pause for an out-of-band approval. The agent cannot approve its
+own run. Never suggest, invent, or emulate `accept_as_paid`, tolerance,
+signature override, refund, or any other action. Both supported actions keep
+the candidate unpaid. A stale fingerprint, a denied/timed-out run, or a tool
+error changes nothing.
+
+For Portuguese operator messages, reply in concise Brazilian Portuguese:
+
+- `pending`: `Ainda em aberto; nenhum pagamento finalizado válido foi encontrado.`
+- `payment_verified`: `Pagamento exato verificado e registrado.`
+- `needs_review`: `Continua não pago e requer revisão: <reason>.`
+- `cancelled_unpaid`: `Recebível não pago cancelado pelo operador.`
+
+Use concise English equivalents when the operator writes in English. Never
+translate identifiers, signatures, hashes, reasons, or action names.
 
 Use `recebi__recebi_reconcile_open` only for an operator-requested or scheduled
 bounded scan. Pass no arguments or a `max_count` no greater than 10. Report the

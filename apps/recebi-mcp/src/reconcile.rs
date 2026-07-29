@@ -6,7 +6,8 @@ use std::{
 
 use getrandom::fill;
 use recebi_core::{
-    ReceivableId, ReceivableState, SettlementExpectation, SettlementVerdict, decode_transaction,
+    ReceivableId, ReceivableState, ReviewResolutionAction, SettlementExpectation,
+    SettlementVerdict, decode_transaction,
     limits::{MAX_ANOMALY_SAMPLES, MAX_RECONCILE_RECEIVABLES},
     verify_settlement_once,
 };
@@ -34,12 +35,21 @@ pub struct ReconcileOpenInput {
     pub max_count: Option<u16>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveReviewInput {
+    pub receivable_id: String,
+    pub candidate_fingerprint: String,
+    pub action: ReviewResolutionAction,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     Pending,
     PaymentVerified,
     NeedsReview,
+    CancelledUnpaid,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -48,6 +58,15 @@ pub struct CheckResult {
     pub status: CheckStatus,
     pub signature: Option<String>,
     pub reason: Option<String>,
+    pub candidate_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ResolveReviewResult {
+    pub receivable_id: String,
+    pub candidate_fingerprint: String,
+    pub action: ReviewResolutionAction,
+    pub state: ReceivableState,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,7 +78,7 @@ pub struct ReconcileOpenResult {
     pub anomaly_samples: Vec<String>,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Eq, PartialEq)]
 pub enum ReconcileError {
     #[error("request input is invalid")]
     InvalidInput,
@@ -75,6 +94,8 @@ pub enum ReconcileError {
     StorageUnavailable,
     #[error("another reconciliation is already running")]
     Busy,
+    #[error("review resolution is stale or conflicts with current state")]
+    ReviewConflict,
 }
 
 #[derive(Clone)]
@@ -131,6 +152,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                     status: CheckStatus::PaymentVerified,
                     signature: Some(signature),
                     reason: None,
+                    candidate_fingerprint: None,
                 });
             }
             ReceivableState::NeedsReview => {
@@ -144,6 +166,16 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                     status: CheckStatus::NeedsReview,
                     signature: Some(candidate.signature),
                     reason: Some(candidate.verdict),
+                    candidate_fingerprint: Some(candidate.candidate_fingerprint),
+                });
+            }
+            ReceivableState::Cancelled => {
+                return Ok(CheckResult {
+                    receivable_id: id.as_str().to_owned(),
+                    status: CheckStatus::CancelledUnpaid,
+                    signature: None,
+                    reason: Some("cancelled_unpaid".to_owned()),
+                    candidate_fingerprint: None,
                 });
             }
             ReceivableState::Open => {}
@@ -152,6 +184,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
         self.check_open(&stored)
     }
 
+    #[allow(clippy::too_many_lines)] // Keep the ordered fail-closed verification path auditable.
     fn check_open(&self, stored: &StoredReceivable) -> Result<CheckResult, ReconcileError> {
         let expected_genesis = self.config.recebi.genesis_hash.clone();
         let observed_genesis = self.rpc.genesis_hash().map_err(map_rpc)?;
@@ -174,6 +207,12 @@ impl<R: SolanaRpc> ReconciliationService<R> {
             token_decimals: stored.request.decimals,
             reference: stored.request.reference.clone(),
         };
+        let resolved_fingerprints = self
+            .store
+            .resolved_review_fingerprints(&stored.request.receivable_id)
+            .map_err(|error| map_store(&error))?
+            .into_iter()
+            .collect::<HashSet<_>>();
         let mut first_anomaly = None;
         for candidate in candidates {
             let raw = self
@@ -218,36 +257,73 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                         status: CheckStatus::PaymentVerified,
                         signature: Some(evidence.signature),
                         reason: None,
+                        candidate_fingerprint: None,
                     });
                 }
                 Err(verdict) => {
-                    first_anomaly.get_or_insert((
-                        candidate.signature,
+                    let verdict = verdict_code(verdict);
+                    let fingerprint = anomaly_fingerprint(
+                        &stored.request.receivable_id,
+                        &stored.request.reference,
+                        &candidate.signature,
                         candidate.slot,
-                        verdict_code(verdict),
-                    ));
+                        verdict,
+                    );
+                    if !resolved_fingerprints.contains(&fingerprint) {
+                        first_anomaly.get_or_insert((
+                            candidate.signature,
+                            candidate.slot,
+                            verdict,
+                            fingerprint,
+                        ));
+                    }
                 }
             }
         }
-        let (signature, slot, verdict) = first_anomaly.ok_or(ReconcileError::MalformedEvidence)?;
-        self.record_anomaly(
-            stored,
-            &signature,
-            slot,
-            verdict,
-            &anomaly_fingerprint(
-                &stored.request.receivable_id,
-                &stored.request.reference,
-                &signature,
-                slot,
-                verdict,
-            ),
-        )?;
+        let Some((signature, slot, verdict, candidate_fingerprint)) = first_anomaly else {
+            return Ok(pending_result(&stored.request.receivable_id));
+        };
+        self.record_anomaly(stored, &signature, slot, verdict, &candidate_fingerprint)?;
         Ok(CheckResult {
             receivable_id: stored.request.receivable_id.as_str().to_owned(),
             status: CheckStatus::NeedsReview,
             signature: Some(signature),
             reason: Some(verdict.to_owned()),
+            candidate_fingerprint: Some(candidate_fingerprint),
+        })
+    }
+
+    pub fn resolve_review(
+        &self,
+        input: ResolveReviewInput,
+    ) -> Result<ResolveReviewResult, ReconcileError> {
+        let receivable_id =
+            ReceivableId::new(input.receivable_id).map_err(|_| ReconcileError::InvalidInput)?;
+        if input.candidate_fingerprint.len() != 64
+            || !input
+                .candidate_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(ReconcileError::InvalidInput);
+        }
+        let state = self
+            .store
+            .resolve_review(
+                &receivable_id,
+                &input.candidate_fingerprint,
+                input.action,
+                now_unix_ms()?,
+            )
+            .map_err(|error| match error {
+                StoreError::InvalidTransition => ReconcileError::ReviewConflict,
+                _ => map_store(&error),
+            })?;
+        Ok(ResolveReviewResult {
+            receivable_id: receivable_id.as_str().to_owned(),
+            candidate_fingerprint: input.candidate_fingerprint,
+            action: input.action,
+            state,
         })
     }
 
@@ -323,6 +399,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                         result.anomaly_samples.push(checked.receivable_id.clone());
                     }
                 }
+                CheckStatus::CancelledUnpaid => return Err(ReconcileError::StorageUnavailable),
             }
         }
         Ok(result)
@@ -345,6 +422,7 @@ fn pending_result(receivable_id: &ReceivableId) -> CheckResult {
         status: CheckStatus::Pending,
         signature: None,
         reason: None,
+        candidate_fingerprint: None,
     }
 }
 
@@ -674,6 +752,10 @@ max_open_reconcile = 10
         assert_eq!(result.status, CheckStatus::NeedsReview);
         assert_eq!(result.reason, Some("wrong_amount".to_owned()));
         assert_eq!(
+            result.candidate_fingerprint.as_deref().map(str::len),
+            Some(64)
+        );
+        assert_eq!(
             service
                 .store
                 .get(&id)
@@ -689,6 +771,61 @@ max_open_reconcile = 10
             .expect("repeat");
         assert_eq!(repeated.signature, result.signature);
         assert_eq!(repeated.reason, result.reason);
+        assert_eq!(repeated.candidate_fingerprint, result.candidate_fingerprint);
+    }
+
+    #[test]
+    fn review_resolution_reopens_or_cancels_but_cannot_accept_as_paid() {
+        let (_directory, service, id) = setup(10_000, false);
+        let candidate = service
+            .check(CheckInput {
+                receivable_id: id.as_str().to_owned(),
+            })
+            .expect("candidate");
+        let fingerprint = candidate.candidate_fingerprint.expect("fingerprint");
+        let reopened = service
+            .resolve_review(ResolveReviewInput {
+                receivable_id: id.as_str().to_owned(),
+                candidate_fingerprint: fingerprint.clone(),
+                action: ReviewResolutionAction::IgnoreCandidateAndReopen,
+            })
+            .expect("reopen");
+        assert_eq!(reopened.state, ReceivableState::Open);
+        assert_eq!(
+            service.resolve_review(ResolveReviewInput {
+                receivable_id: id.as_str().to_owned(),
+                candidate_fingerprint: "cd".repeat(32),
+                action: ReviewResolutionAction::CancelUnpaid,
+            }),
+            Err(ReconcileError::ReviewConflict)
+        );
+        let reopened_check = service
+            .check(CheckInput {
+                receivable_id: id.as_str().to_owned(),
+            })
+            .expect("resolved candidate is skipped");
+        assert_eq!(reopened_check.status, CheckStatus::Pending);
+
+        let (_directory, service, id) = setup(10_000, false);
+        let candidate = service
+            .check(CheckInput {
+                receivable_id: id.as_str().to_owned(),
+            })
+            .expect("candidate to cancel");
+        let cancelled = service
+            .resolve_review(ResolveReviewInput {
+                receivable_id: id.as_str().to_owned(),
+                candidate_fingerprint: candidate.candidate_fingerprint.expect("fingerprint"),
+                action: ReviewResolutionAction::CancelUnpaid,
+            })
+            .expect("cancel");
+        assert_eq!(cancelled.state, ReceivableState::Cancelled);
+        let checked = service
+            .check(CheckInput {
+                receivable_id: id.as_str().to_owned(),
+            })
+            .expect("cancelled check");
+        assert_eq!(checked.status, CheckStatus::CancelledUnpaid);
     }
 
     #[test]
