@@ -825,10 +825,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "solana-address 2.6.1",
  "solana-message",
  "solana-pubkey 4.2.0",
- "solana-short-vec",
  "solana-signature",
  "solana-transaction",
  "spl-token-interface",
@@ -870,8 +868,6 @@ dependencies = [
  "percent-encoding",
  "recebi-core",
  "rusqlite",
- "serde",
- "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
@@ -1241,7 +1237,6 @@ version = "3.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8250a4495aad49ad20556a607da53bdcb20de78da10b65afbf918b7f1de647"
 dependencies = [
- "serde_core",
  "wincode",
 ]
 

@@ -17,8 +17,8 @@ pub use model::{
     ReceivableState, Reference,
 };
 pub use ptax::{
-    PtaxDate, PtaxDecimal, PtaxEvidence, PtaxQuoteCandidate, UsdValuationMethod,
-    brl_reference_cents, select_strict_same_day_quote,
+    NOMINAL_USDC_USD_METHOD, PtaxDate, PtaxDecimal, PtaxEvidence, PtaxQuoteCandidate,
+    nominal_brl_reference_cents, select_strict_same_day_quote,
 };
 pub use settlement::{
     AccountMeta, CompiledInstruction, SettlementEvidence, SettlementExpectation, SettlementVerdict,

@@ -40,12 +40,17 @@ bounded scan. Pass no arguments or a `max_count` no greater than 10. Report the
 four counts and at most the returned anomaly IDs. Do not retry automatically,
 fetch raw RPC data, inspect transaction memos, or infer settlement from chat.
 
-Use `recebi__recebi_close_month` only when the operator explicitly asks to
-close a UTC settlement month. Pass exactly `month` in `YYYY-MM` form. Report
-the verified, valued, and valuation-pending counts plus the three hashes and
-export directory returned by the tool.
+Use `recebi__recebi_snapshot_month` when the operator asks for a report,
+preview, or export of the active UTC month. Pass exactly `month` in `YYYY-MM`
+form. Describe it as a provisional snapshot, never as a final close.
 
-A successful close does not mean every valuation exists. Say
+Use `recebi__recebi_close_month` only when the operator explicitly asks to
+finally close a completed UTC settlement month. Never use it for the active or
+a future month. Pass exactly `month` in `YYYY-MM` form. Report the artifact
+kind, revision, verified, valued, and valuation-pending counts plus the three
+hashes and export directory returned by the tool.
+
+A successful snapshot or close does not mean every valuation exists. Say
 `valuation_pending` literally when the count is non-zero. Describe the files
 only as “accountant-ready evidence” that “may assist record keeping.” Never
 claim that PTAX proves USDC fair value, tax treatment, DeCripto compliance, or

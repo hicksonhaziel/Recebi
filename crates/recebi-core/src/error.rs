@@ -30,6 +30,4 @@ pub enum CoreError {
     InvalidPtaxQuote,
     #[error("valuation amount exceeds supported range")]
     ValuationOverflow,
-    #[error("operator-supplied USD value is required")]
-    MissingOperatorUsdValue,
 }

@@ -142,17 +142,28 @@ impl AppConfig {
     pub fn ensure_data_directory(&self) -> Result<(), ConfigError> {
         fs::create_dir_all(&self.recebi.data_dir)
             .map_err(|_| ConfigError::DataDirectoryUnavailable)?;
-        if self.recebi.data_dir.is_dir() {
-            Ok(())
-        } else {
-            Err(ConfigError::DataDirectoryUnavailable)
+        if !self.recebi.data_dir.is_dir() {
+            return Err(ConfigError::DataDirectoryUnavailable);
         }
+        secure_directory(&self.recebi.data_dir)
     }
 
     #[must_use]
     pub fn database_path(&self) -> PathBuf {
         self.recebi.data_dir.join("recebi.sqlite3")
     }
+}
+
+#[cfg(unix)]
+fn secure_directory(path: &Path) -> Result<(), ConfigError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|_| ConfigError::DataDirectoryUnavailable)
+}
+
+#[cfg(not(unix))]
+fn secure_directory(_path: &Path) -> Result<(), ConfigError> {
+    Ok(())
 }
 
 #[cfg(test)]

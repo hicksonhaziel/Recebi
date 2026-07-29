@@ -1,11 +1,12 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use recebi_core::{PtaxDate, PtaxDecimal, UsdValuationMethod, brl_reference_cents};
+use recebi_core::{NOMINAL_USDC_USD_METHOD, PtaxDate, PtaxDecimal, nominal_brl_reference_cents};
 use recebi_store::{
     ReceivableStore, StoreError, StoredMonthClose, StoredSettledReceivable, StoredValuation,
 };
@@ -17,6 +18,7 @@ use crate::{config::AppConfig, ptax::PtaxClient};
 
 const EXPORT_SCHEMA: &str = "recebi.monthly_evidence.v1";
 const MANIFEST_SCHEMA: &str = "recebi.export_manifest.v1";
+const EXPORT_LEASE_MS: i64 = 10 * 60 * 1_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,9 +26,17 @@ pub struct CloseMonthInput {
     pub month: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotMonthInput {
+    pub month: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CloseMonthOutput {
     pub status: &'static str,
+    pub artifact_kind: &'static str,
+    pub revision: Option<u32>,
     pub month: String,
     pub payment_verified: usize,
     pub valued: usize,
@@ -38,10 +48,40 @@ pub struct CloseMonthOutput {
     pub note: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExportMode {
+    ProvisionalSnapshot,
+    FinalClose,
+}
+
+impl ExportMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProvisionalSnapshot => "provisional_snapshot",
+            Self::FinalClose => "final_close",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ValuationPendingReason {
+    QuoteUnavailable,
+    SourceUnavailable,
+    ResponseTooLarge,
+    ResponseInvalid,
+}
+
 #[derive(Debug, Error)]
 pub enum CloseMonthError {
     #[error("month must use YYYY-MM")]
     InvalidMonth,
+    #[error("final close requires a completed UTC month")]
+    MonthNotEligible,
+    #[error("future UTC month cannot be exported")]
+    FutureMonth,
+    #[error("another export for this month is already running")]
+    Busy,
     #[error("monthly ledger integrity check failed")]
     Integrity,
     #[error("monthly export is unavailable")]
@@ -81,88 +121,137 @@ impl<P: PtaxClient> CloseMonthService<P> {
     ///
     /// Invalid month, ledger integrity, or local export failures are returned
     /// without weakening a previously verified payment.
-    pub fn close(&self, input: CloseMonthInput) -> Result<CloseMonthOutput, CloseMonthError> {
+    pub fn close(&self, input: &CloseMonthInput) -> Result<CloseMonthOutput, CloseMonthError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| CloseMonthError::Unavailable)?;
         let now_ms = i64::try_from(now.as_millis()).map_err(|_| CloseMonthError::Unavailable)?;
-        self.close_at(input, now_ms)
+        self.export_at(&input.month, ExportMode::FinalClose, now_ms)
     }
 
-    fn close_at(
+    /// Creates a provisional snapshot for the current or a completed month.
+    ///
+    /// # Errors
+    ///
+    /// Future months, ledger integrity failures, or publication errors fail.
+    pub fn snapshot(
         &self,
-        input: CloseMonthInput,
+        input: &SnapshotMonthInput,
+    ) -> Result<CloseMonthOutput, CloseMonthError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| CloseMonthError::Unavailable)?;
+        let now_ms = i64::try_from(now.as_millis()).map_err(|_| CloseMonthError::Unavailable)?;
+        self.export_at(&input.month, ExportMode::ProvisionalSnapshot, now_ms)
+    }
+
+    fn export_at(
+        &self,
+        month: &str,
+        mode: ExportMode,
         retrieved_at_unix_ms: i64,
     ) -> Result<CloseMonthOutput, CloseMonthError> {
-        let (start, end) = month_bounds(&input.month)?;
+        validate_eligibility(month, mode, retrieved_at_unix_ms)?;
+        let owner = random_owner()?;
+        self.store
+            .acquire_monthly_export_lease(
+                month,
+                &owner,
+                retrieved_at_unix_ms,
+                retrieved_at_unix_ms
+                    .checked_add(EXPORT_LEASE_MS)
+                    .ok_or(CloseMonthError::Unavailable)?,
+            )
+            .map_err(|error| map_store(&error))?;
+        let result = self.export_locked(month, mode, retrieved_at_unix_ms, &owner);
+        let released = self
+            .store
+            .release_monthly_export_lease(month, &owner)
+            .map_err(|error| map_store(&error));
+        match (result, released) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn export_locked(
+        &self,
+        month: &str,
+        mode: ExportMode,
+        retrieved_at_unix_ms: i64,
+        owner: &str,
+    ) -> Result<CloseMonthOutput, CloseMonthError> {
+        let (start, end) = month_bounds(month)?;
         let initial = self
             .store
             .list_settled_between(start, end)
             .map_err(|error| map_store(&error))?;
-        let mut quotes = BTreeMap::new();
-        for row in initial.iter().filter(|row| row.valuation.is_none()) {
-            let operation_date = PtaxDate::from_unix_seconds(row.block_time_unix)
-                .map_err(|_| CloseMonthError::Integrity)?;
-            let evidence = if let Some(cached) = quotes.get(&operation_date).cloned() {
-                cached
-            } else {
-                let fetched = self
-                    .ptax
-                    .quote(&operation_date, retrieved_at_unix_ms)
-                    .unwrap_or_default();
-                quotes.insert(operation_date.clone(), fetched.clone());
-                fetched
-            };
-            if let Some(evidence) = evidence {
-                let sale =
-                    PtaxDecimal::parse(&evidence.sale).map_err(|_| CloseMonthError::Integrity)?;
-                let method = UsdValuationMethod::NominalUsdcEqualsUsd;
-                let brl_reference_cents = brl_reference_cents(
-                    row.receivable.request.amount,
-                    self.token_decimals,
-                    sale,
-                    &method,
-                )
-                .map_err(|_| CloseMonthError::Integrity)?;
-                self.store
-                    .attach_valuation(
-                        &row.receivable.request.receivable_id,
-                        &StoredValuation {
-                            evidence,
-                            valuation_method: method,
-                            brl_reference_cents,
-                        },
-                    )
-                    .map_err(|error| map_store(&error))?;
-            }
-        }
+        let pending_reasons = self.attach_available_valuations(&initial, retrieved_at_unix_ms)?;
+        let root_before = self
+            .store
+            .ledger_fingerprint()
+            .map_err(|error| map_store(&error))?;
         let rows = self
             .store
             .list_settled_between(start, end)
             .map_err(|error| map_store(&error))?;
-        let canonical_json =
-            canonical_evidence(&input.month, &rows).map_err(|_| CloseMonthError::Integrity)?;
+        let root_after = self
+            .store
+            .ledger_fingerprint()
+            .map_err(|error| map_store(&error))?;
+        if root_before != root_after {
+            return Err(CloseMonthError::Busy);
+        }
+        let canonical_json = canonical_evidence(month, mode, &rows, &pending_reasons)
+            .map_err(|_| CloseMonthError::Integrity)?;
         let accountant_csv = accountant_csv(&rows);
         let evidence_hash = sha256_hex(&canonical_json);
         let csv_hash = sha256_hex(&accountant_csv);
-        let manifest_json = manifest(&input.month, &evidence_hash, &csv_hash)
+        let manifest_json = manifest(month, mode, &evidence_hash, &csv_hash)
             .map_err(|_| CloseMonthError::Integrity)?;
         let manifest_hash = sha256_hex(&manifest_json);
-        let close = self
-            .store
-            .record_month_close(StoredMonthClose {
-                month: input.month.clone(),
-                canonical_json,
-                accountant_csv,
-                manifest_json,
-            })
-            .map_err(|error| map_store(&error))?;
-        let directory = self.export_root.join(&input.month);
-        write_exports(&directory, &input.month, &close)?;
+        let close = StoredMonthClose {
+            month: month.to_owned(),
+            revision: 0,
+            artifact_kind: mode.as_str().to_owned(),
+            canonical_json,
+            accountant_csv,
+            manifest_json,
+        };
+        let (close, directory) = match mode {
+            ExportMode::FinalClose => {
+                let close = self
+                    .store
+                    .record_month_close(close, &root_after)
+                    .map_err(|error| map_store(&error))?;
+                let directory = self
+                    .export_root
+                    .join("closed")
+                    .join(month)
+                    .join(format!("revision-{}", close.revision));
+                write_exports_atomic(&directory, month, &close, owner)?;
+                (close, directory)
+            }
+            ExportMode::ProvisionalSnapshot => {
+                let directory = self
+                    .export_root
+                    .join("snapshots")
+                    .join(month)
+                    .join(&evidence_hash[..16]);
+                write_exports_atomic(&directory, month, &close, owner)?;
+                (close, directory)
+            }
+        };
         let valued = rows.iter().filter(|row| row.valuation.is_some()).count();
         Ok(CloseMonthOutput {
-            status: "closed",
-            month: input.month,
+            status: if mode == ExportMode::FinalClose {
+                "closed"
+            } else {
+                "snapshot_created"
+            },
+            artifact_kind: mode.as_str(),
+            revision: (mode == ExportMode::FinalClose).then_some(close.revision),
+            month: month.to_owned(),
             payment_verified: rows.len(),
             valued,
             valuation_pending: rows.len() - valued,
@@ -173,12 +262,78 @@ impl<P: PtaxClient> CloseMonthService<P> {
             note: "Accountant-ready evidence that may assist record keeping; not tax or legal advice.",
         })
     }
+
+    fn attach_available_valuations(
+        &self,
+        rows: &[StoredSettledReceivable],
+        retrieved_at_unix_ms: i64,
+    ) -> Result<BTreeMap<String, ValuationPendingReason>, CloseMonthError> {
+        let mut quotes = BTreeMap::new();
+        let mut pending_reasons = BTreeMap::new();
+        for row in rows.iter().filter(|row| row.valuation.is_none()) {
+            let operation_date = PtaxDate::from_unix_seconds(row.block_time_unix)
+                .map_err(|_| CloseMonthError::Integrity)?;
+            let evidence = if let Some(cached) = quotes.get(&operation_date).cloned() {
+                cached
+            } else {
+                let fetched = self.ptax.quote(&operation_date, retrieved_at_unix_ms);
+                quotes.insert(operation_date.clone(), fetched.clone());
+                fetched
+            };
+            match evidence {
+                Ok(Some(evidence)) => {
+                    let sale = PtaxDecimal::parse(&evidence.sale)
+                        .map_err(|_| CloseMonthError::Integrity)?;
+                    let brl_reference_cents = nominal_brl_reference_cents(
+                        row.receivable.request.amount,
+                        self.token_decimals,
+                        sale,
+                    )
+                    .map_err(|_| CloseMonthError::Integrity)?;
+                    self.store
+                        .attach_valuation(
+                            &row.receivable.request.receivable_id,
+                            &StoredValuation {
+                                evidence,
+                                brl_reference_cents,
+                            },
+                        )
+                        .map_err(|error| map_store(&error))?;
+                }
+                Ok(None) => {
+                    pending_reasons.insert(
+                        row.receivable.request.receivable_id.as_str().to_owned(),
+                        ValuationPendingReason::QuoteUnavailable,
+                    );
+                }
+                Err(error) => {
+                    let reason = match error {
+                        crate::ptax::PtaxError::Unavailable => {
+                            ValuationPendingReason::SourceUnavailable
+                        }
+                        crate::ptax::PtaxError::ResponseTooLarge => {
+                            ValuationPendingReason::ResponseTooLarge
+                        }
+                        crate::ptax::PtaxError::MalformedResponse => {
+                            ValuationPendingReason::ResponseInvalid
+                        }
+                    };
+                    pending_reasons.insert(
+                        row.receivable.request.receivable_id.as_str().to_owned(),
+                        reason,
+                    );
+                }
+            }
+        }
+        Ok(pending_reasons)
+    }
 }
 
 #[derive(Serialize)]
 struct MonthlyEvidence<'a> {
     schema: &'static str,
     month: &'a str,
+    artifact_kind: &'static str,
     canonical_state: &'static str,
     valuation_policy: &'static str,
     rounding_policy: &'static str,
@@ -199,12 +354,22 @@ struct EvidenceRecord<'a> {
     slot: u64,
     block_time_unix: i64,
     settlement_fingerprint: &'a str,
-    valuation: Option<&'a StoredValuation>,
+    valuation_pending_reason: Option<ValuationPendingReason>,
+    valuation: Option<ValuationEvidence<'a>>,
+}
+
+#[derive(Serialize)]
+struct ValuationEvidence<'a> {
+    evidence: &'a recebi_core::PtaxEvidence,
+    valuation_method: &'static str,
+    brl_reference_cents: u64,
 }
 
 fn canonical_evidence(
     month: &str,
+    mode: ExportMode,
     rows: &[StoredSettledReceivable],
+    pending_reasons: &BTreeMap<String, ValuationPendingReason>,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let records = rows
         .iter()
@@ -225,12 +390,25 @@ fn canonical_evidence(
             slot: row.slot,
             block_time_unix: row.block_time_unix,
             settlement_fingerprint: &row.settlement_fingerprint,
-            valuation: row.valuation.as_ref(),
+            valuation_pending_reason: row.valuation.as_ref().map_or_else(
+                || {
+                    pending_reasons
+                        .get(row.receivable.request.receivable_id.as_str())
+                        .copied()
+                },
+                |_| None,
+            ),
+            valuation: row.valuation.as_ref().map(|valuation| ValuationEvidence {
+                evidence: &valuation.evidence,
+                valuation_method: NOMINAL_USDC_USD_METHOD,
+                brl_reference_cents: valuation.brl_reference_cents,
+            }),
         })
         .collect();
     let mut bytes = serde_json::to_vec(&MonthlyEvidence {
         schema: EXPORT_SCHEMA,
         month,
+        artifact_kind: mode.as_str(),
         canonical_state: "JSON evidence; CSV is presentation only",
         valuation_policy: "strict same-day BCB PTAX sale; nominal 1 USDC = 1 USD assumption",
         rounding_policy: "BRL cents, integer half-up",
@@ -291,12 +469,14 @@ fn accountant_csv(rows: &[StoredSettledReceivable]) -> Vec<u8> {
 
 fn manifest(
     month: &str,
+    mode: ExportMode,
     evidence_hash: &str,
     csv_hash: &str,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let mut bytes = serde_json::to_vec(&serde_json::json!({
         "schema": MANIFEST_SCHEMA,
         "month": month,
+        "artifact_kind": mode.as_str(),
         "files": [
             {"name": format!("recebi-{month}.evidence.json"), "sha256": evidence_hash},
             {"name": format!("recebi-{month}.accountant.csv"), "sha256": csv_hash}
@@ -306,13 +486,55 @@ fn manifest(
     Ok(bytes)
 }
 
-fn write_exports(
+fn write_exports_atomic(
+    directory: &Path,
+    month: &str,
+    close: &StoredMonthClose,
+    owner: &str,
+) -> Result<(), CloseMonthError> {
+    if directory.is_dir() {
+        return verify_published_files(directory, month, close);
+    }
+    let parent = directory.parent().ok_or(CloseMonthError::Unavailable)?;
+    create_secure_directory(parent)?;
+    let name = directory
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(CloseMonthError::Unavailable)?;
+    let temporary = parent.join(format!(".{name}.tmp-{owner}"));
+    if temporary.exists() {
+        fs::remove_dir_all(&temporary).map_err(|_| CloseMonthError::Unavailable)?;
+    }
+    create_secure_directory(&temporary)?;
+    let files = [
+        (
+            temporary.join(format!("recebi-{month}.evidence.json")),
+            &close.canonical_json,
+        ),
+        (
+            temporary.join(format!("recebi-{month}.accountant.csv")),
+            &close.accountant_csv,
+        ),
+        (
+            temporary.join(format!("recebi-{month}.manifest.json")),
+            &close.manifest_json,
+        ),
+    ];
+    for (path, bytes) in files {
+        write_secure_file(&path, bytes)?;
+    }
+    sync_directory(&temporary)?;
+    fs::rename(&temporary, directory).map_err(|_| CloseMonthError::Unavailable)?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn verify_published_files(
     directory: &Path,
     month: &str,
     close: &StoredMonthClose,
 ) -> Result<(), CloseMonthError> {
-    fs::create_dir_all(directory).map_err(|_| CloseMonthError::Unavailable)?;
-    let files = [
+    let expected = [
         (
             directory.join(format!("recebi-{month}.evidence.json")),
             &close.canonical_json,
@@ -326,12 +548,45 @@ fn write_exports(
             &close.manifest_json,
         ),
     ];
-    for (path, bytes) in files {
-        let temporary = path.with_extension("tmp");
-        fs::write(&temporary, bytes).map_err(|_| CloseMonthError::Unavailable)?;
-        fs::rename(&temporary, &path).map_err(|_| CloseMonthError::Unavailable)?;
+    for (path, bytes) in expected {
+        if fs::read(path).map_err(|_| CloseMonthError::Integrity)? != *bytes {
+            return Err(CloseMonthError::Integrity);
+        }
     }
     Ok(())
+}
+
+fn write_secure_file(path: &Path, bytes: &[u8]) -> Result<(), CloseMonthError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| CloseMonthError::Unavailable)?;
+    file.write_all(bytes)
+        .map_err(|_| CloseMonthError::Unavailable)?;
+    file.sync_all().map_err(|_| CloseMonthError::Unavailable)
+}
+
+fn create_secure_directory(path: &Path) -> Result<(), CloseMonthError> {
+    fs::create_dir_all(path).map_err(|_| CloseMonthError::Unavailable)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|_| CloseMonthError::Unavailable)?;
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), CloseMonthError> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| CloseMonthError::Unavailable)
 }
 
 fn month_bounds(month: &str) -> Result<(i64, i64), CloseMonthError> {
@@ -357,6 +612,33 @@ fn month_bounds(month: &str) -> Result<(i64, i64), CloseMonthError> {
         days_from_civil(year, month_number, 1) * 86_400,
         days_from_civil(next_year, next_month, 1) * 86_400,
     ))
+}
+
+fn validate_eligibility(
+    month: &str,
+    mode: ExportMode,
+    now_unix_ms: i64,
+) -> Result<(), CloseMonthError> {
+    month_bounds(month)?;
+    let now_seconds = now_unix_ms
+        .checked_div(1_000)
+        .ok_or(CloseMonthError::Unavailable)?;
+    let current =
+        PtaxDate::from_unix_seconds(now_seconds).map_err(|_| CloseMonthError::Unavailable)?;
+    let current_month = &current.as_str()[0..7];
+    if month > current_month {
+        return Err(CloseMonthError::FutureMonth);
+    }
+    if mode == ExportMode::FinalClose && month >= current_month {
+        return Err(CloseMonthError::MonthNotEligible);
+    }
+    Ok(())
+}
+
+fn random_owner() -> Result<String, CloseMonthError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| CloseMonthError::Unavailable)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -388,6 +670,7 @@ fn csv_field(value: &str) -> String {
 fn map_store(error: &StoreError) -> CloseMonthError {
     match error {
         StoreError::Integrity | StoreError::InvalidTransition => CloseMonthError::Integrity,
+        StoreError::MonthlyExportBusy | StoreError::ConcurrentMutation => CloseMonthError::Busy,
         _ => CloseMonthError::Unavailable,
     }
 }
@@ -508,20 +791,10 @@ max_open_reconcile = 10
         )
         .expect("service");
         let first = service
-            .close_at(
-                CloseMonthInput {
-                    month: "2025-07".to_owned(),
-                },
-                123,
-            )
+            .export_at("2025-07", ExportMode::FinalClose, 1_754_006_400_000)
             .expect("close");
         let second = service
-            .close_at(
-                CloseMonthInput {
-                    month: "2025-07".to_owned(),
-                },
-                999,
-            )
+            .export_at("2025-07", ExportMode::FinalClose, 1_754_006_401_000)
             .expect("idempotent close");
         assert_eq!(first.evidence_json_sha256, second.evidence_json_sha256);
         assert_eq!(first.valued, 1);
@@ -539,7 +812,7 @@ max_open_reconcile = 10
         let manifest = std::fs::read(
             directory
                 .path()
-                .join("data/exports/2025-07/recebi-2025-07.manifest.json"),
+                .join("data/exports/closed/2025-07/revision-1/recebi-2025-07.manifest.json"),
         )
         .expect("manifest");
         assert_eq!(sha256_hex(&manifest), first.manifest_sha256);
@@ -559,25 +832,22 @@ max_open_reconcile = 10
         )
         .expect("service");
         let output = service
-            .close_at(
-                CloseMonthInput {
-                    month: "2025-07".to_owned(),
-                },
-                123,
-            )
+            .export_at("2025-07", ExportMode::FinalClose, 1_754_006_400_000)
             .expect("honest pending close");
         assert_eq!(output.payment_verified, 1);
         assert_eq!(output.valuation_pending, 1);
         assert_eq!(output.valued, 0);
+        let pending_evidence = std::fs::read_to_string(
+            directory
+                .path()
+                .join("data/exports/closed/2025-07/revision-1/recebi-2025-07.evidence.json"),
+        )
+        .expect("pending evidence");
+        assert!(pending_evidence.contains(r#""valuation_pending_reason":"source_unavailable""#));
 
         *result.lock().expect("lock") = Ok(Some(evidence()));
         let revised = service
-            .close_at(
-                CloseMonthInput {
-                    month: "2025-07".to_owned(),
-                },
-                456,
-            )
+            .export_at("2025-07", ExportMode::FinalClose, 1_754_006_401_000)
             .expect("append-only revised close");
         assert_eq!(revised.valued, 1);
         assert_ne!(output.evidence_json_sha256, revised.evidence_json_sha256);
@@ -595,6 +865,142 @@ max_open_reconcile = 10
     }
 
     #[test]
+    fn active_month_requires_snapshot_and_future_month_is_rejected() {
+        let directory = tempfile::tempdir().expect("dir");
+        let config = config(&directory);
+        settled_store(&config);
+        let service = CloseMonthService::new(
+            &config,
+            FakePtax {
+                result: Arc::new(Mutex::new(Ok(None))),
+            },
+        )
+        .expect("service");
+        let july_2025 = 1_753_747_200_000;
+        assert!(matches!(
+            service.export_at("2025-07", ExportMode::FinalClose, july_2025),
+            Err(CloseMonthError::MonthNotEligible)
+        ));
+        let snapshot = service
+            .export_at("2025-07", ExportMode::ProvisionalSnapshot, july_2025)
+            .expect("active snapshot");
+        assert_eq!(snapshot.status, "snapshot_created");
+        assert_eq!(snapshot.artifact_kind, "provisional_snapshot");
+        assert_eq!(snapshot.revision, None);
+        assert!(snapshot.export_directory.contains("/snapshots/2025-07/"));
+        assert!(matches!(
+            service.export_at("2025-08", ExportMode::ProvisionalSnapshot, july_2025),
+            Err(CloseMonthError::FutureMonth)
+        ));
+    }
+
+    #[test]
+    fn existing_month_lease_blocks_close_until_released() {
+        let directory = tempfile::tempdir().expect("dir");
+        let config = config(&directory);
+        let store = settled_store(&config);
+        let service = CloseMonthService::new(
+            &config,
+            FakePtax {
+                result: Arc::new(Mutex::new(Ok(None))),
+            },
+        )
+        .expect("service");
+        let close_time = 1_754_006_400_000;
+        store
+            .acquire_monthly_export_lease(
+                "2025-07",
+                "competing-owner",
+                close_time,
+                close_time + EXPORT_LEASE_MS,
+            )
+            .expect("lease");
+        assert!(matches!(
+            service.export_at("2025-07", ExportMode::FinalClose, close_time),
+            Err(CloseMonthError::Busy)
+        ));
+        store
+            .release_monthly_export_lease("2025-07", "competing-owner")
+            .expect("release");
+        service
+            .export_at("2025-07", ExportMode::FinalClose, close_time)
+            .expect("close after release");
+    }
+
+    #[test]
+    fn atomic_publication_ignores_stale_temp_and_rejects_visible_mismatch() {
+        let directory = tempfile::tempdir().expect("dir");
+        let target = directory.path().join("revision-1");
+        let stale = directory.path().join(".revision-1.tmp-owner");
+        std::fs::create_dir(&stale).expect("stale temp");
+        std::fs::write(stale.join("partial"), b"incomplete").expect("partial");
+        let close = StoredMonthClose {
+            month: "2025-07".to_owned(),
+            revision: 1,
+            artifact_kind: "final_close".to_owned(),
+            canonical_json: b"{\"complete\":true}\n".to_vec(),
+            accountant_csv: b"a,b\n".to_vec(),
+            manifest_json: b"{\"manifest\":true}\n".to_vec(),
+        };
+        write_exports_atomic(&target, "2025-07", &close, "owner").expect("publish");
+        assert!(!stale.exists());
+        verify_published_files(&target, "2025-07", &close).expect("complete visible revision");
+        std::fs::write(target.join("recebi-2025-07.evidence.json"), b"tampered").expect("tamper");
+        assert!(matches!(
+            write_exports_atomic(&target, "2025-07", &close, "other-owner"),
+            Err(CloseMonthError::Integrity)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_export_directories_and_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("dir");
+        let config = config(&directory);
+        settled_store(&config);
+        let service = CloseMonthService::new(
+            &config,
+            FakePtax {
+                result: Arc::new(Mutex::new(Ok(None))),
+            },
+        )
+        .expect("service");
+        let output = service
+            .export_at("2025-07", ExportMode::FinalClose, 1_754_006_400_000)
+            .expect("close");
+        assert_eq!(
+            std::fs::metadata(&config.recebi.data_dir)
+                .expect("data metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&output.export_directory)
+                .expect("export metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        for entry in std::fs::read_dir(&output.export_directory).expect("export files") {
+            assert_eq!(
+                entry
+                    .expect("entry")
+                    .metadata()
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
     fn rejects_bad_month_and_detects_modified_event_ledger() {
         let directory = tempfile::tempdir().expect("dir");
         let config = config(&directory);
@@ -607,12 +1013,7 @@ max_open_reconcile = 10
         )
         .expect("service");
         assert!(matches!(
-            service.close_at(
-                CloseMonthInput {
-                    month: "2025-13".to_owned()
-                },
-                1
-            ),
+            service.export_at("2025-13", ExportMode::FinalClose, 1_754_006_400_000),
             Err(CloseMonthError::InvalidMonth)
         ));
         let connection = rusqlite::Connection::open(config.database_path()).expect("db");
@@ -623,12 +1024,7 @@ max_open_reconcile = 10
             )
             .expect("tamper");
         assert!(matches!(
-            service.close_at(
-                CloseMonthInput {
-                    month: "2025-07".to_owned()
-                },
-                1
-            ),
+            service.export_at("2025-07", ExportMode::FinalClose, 1_754_006_400_000),
             Err(CloseMonthError::Integrity)
         ));
     }

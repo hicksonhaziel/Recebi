@@ -5,6 +5,7 @@ use crate::{AtomicAmount, CoreError};
 pub const PTAX_DECIMAL_SCALE: u64 = 100_000;
 pub const PTAX_SOURCE_ID: &str = "bcb_ptax_v1_cotacao_dolar_dia";
 pub const PTAX_POLICY_VERSION: &str = "strict_same_day_closing_v1";
+pub const NOMINAL_USDC_USD_METHOD: &str = "nominal_usdc_equals_usd";
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -202,13 +203,6 @@ pub fn select_strict_same_day_quote(
     }))
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum UsdValuationMethod {
-    NominalUsdcEqualsUsd,
-    OperatorSupplied { usd_cents: u64 },
-}
-
 /// Calculates a BRL-cent reference with integer half-up rounding.
 ///
 /// This is a nominal record-keeping reference, not verified USDC fair value.
@@ -216,27 +210,15 @@ pub enum UsdValuationMethod {
 /// # Errors
 ///
 /// Missing operator value, unsupported token precision, and overflow fail.
-pub fn brl_reference_cents(
+pub fn nominal_brl_reference_cents(
     token_amount: AtomicAmount,
     token_decimals: u8,
     sale: PtaxDecimal,
-    method: &UsdValuationMethod,
 ) -> Result<u64, CoreError> {
     let token_scale = 10_u128
         .checked_pow(u32::from(token_decimals))
         .ok_or(CoreError::ValuationOverflow)?;
-    let usd_atomic = match method {
-        UsdValuationMethod::NominalUsdcEqualsUsd => u128::from(token_amount.get()),
-        UsdValuationMethod::OperatorSupplied { usd_cents } if *usd_cents > 0 => {
-            u128::from(*usd_cents)
-                .checked_mul(token_scale)
-                .ok_or(CoreError::ValuationOverflow)?
-                / 100
-        }
-        UsdValuationMethod::OperatorSupplied { .. } => {
-            return Err(CoreError::MissingOperatorUsdValue);
-        }
-    };
+    let usd_atomic = u128::from(token_amount.get());
     let numerator = usd_atomic
         .checked_mul(u128::from(sale.scaled()))
         .and_then(|value| value.checked_mul(100))
@@ -360,38 +342,18 @@ mod tests {
     fn calculates_known_value_and_half_up_rounding_with_assumption_disclosed() {
         let sale = PtaxDecimal::parse("5.11770").expect("sale");
         assert_eq!(
-            brl_reference_cents(
-                AtomicAmount::new(100_000),
-                6,
-                sale,
-                &UsdValuationMethod::NominalUsdcEqualsUsd
-            )
-            .expect("BRL"),
+            nominal_brl_reference_cents(AtomicAmount::new(100_000), 6, sale).expect("BRL"),
             51
         );
         assert_eq!(
-            brl_reference_cents(
+            nominal_brl_reference_cents(
                 AtomicAmount::new(1),
                 2,
-                PtaxDecimal::parse("0.50000").expect("sale"),
-                &UsdValuationMethod::NominalUsdcEqualsUsd
+                PtaxDecimal::parse("0.50000").expect("sale")
             )
             .expect("rounding"),
             1
         );
-        assert_eq!(
-            brl_reference_cents(
-                AtomicAmount::new(1),
-                6,
-                sale,
-                &UsdValuationMethod::OperatorSupplied { usd_cents: 0 }
-            ),
-            Err(CoreError::MissingOperatorUsdValue)
-        );
-        assert!(
-            serde_json::to_string(&UsdValuationMethod::NominalUsdcEqualsUsd)
-                .expect("serialize")
-                .contains("nominal_usdc_equals_usd")
-        );
+        assert_eq!(NOMINAL_USDC_USD_METHOD, "nominal_usdc_equals_usd");
     }
 }

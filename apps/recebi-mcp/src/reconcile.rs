@@ -360,7 +360,9 @@ fn map_store(error: &StoreError) -> ReconcileError {
         | StoreError::IdempotencyConflict
         | StoreError::ReferenceReuse
         | StoreError::InvalidTransition
-        | StoreError::Replay => ReconcileError::StorageUnavailable,
+        | StoreError::Replay
+        | StoreError::MonthlyExportBusy
+        | StoreError::ConcurrentMutation => ReconcileError::StorageUnavailable,
     }
 }
 

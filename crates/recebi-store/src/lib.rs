@@ -5,12 +5,11 @@ use std::{
 };
 
 use recebi_core::{
-    AtomicAmount, BoundedText, PaymentRequest, PtaxDate, PtaxEvidence, PublicKey, ReceivableId,
-    ReceivableState, Reference, SettlementEvidence, UsdValuationMethod,
+    AtomicAmount, BoundedText, NOMINAL_USDC_USD_METHOD, PaymentRequest, PtaxDate, PtaxEvidence,
+    PublicKey, ReceivableId, ReceivableState, Reference, SettlementEvidence,
     limits::{MAX_MONTH_EXPORT_ROWS, MAX_PUBLIC_LABEL_BYTES},
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -33,6 +32,10 @@ pub enum StoreError {
     Replay,
     #[error("another reconciliation is already running")]
     ReconciliationBusy,
+    #[error("another monthly export is already running")]
+    MonthlyExportBusy,
+    #[error("the material ledger changed during export")]
+    ConcurrentMutation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,10 +52,9 @@ pub struct StoredReviewCandidate {
     pub verdict: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredValuation {
     pub evidence: PtaxEvidence,
-    pub valuation_method: UsdValuationMethod,
     pub brl_reference_cents: u64,
 }
 
@@ -69,6 +71,8 @@ pub struct StoredSettledReceivable {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredMonthClose {
     pub month: String,
+    pub revision: u32,
+    pub artifact_kind: String,
     pub canonical_json: Vec<u8>,
     pub accountant_csv: Vec<u8>,
     pub manifest_json: Vec<u8>,
@@ -153,19 +157,13 @@ impl ReceivableStore {
                  response_sha256 TEXT NOT NULL,
                  source_id TEXT NOT NULL,
                  policy_version TEXT NOT NULL,
-                 valuation_method_json TEXT NOT NULL,
+                 valuation_method TEXT NOT NULL,
                  brl_reference_cents INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS month_closes (
-                 month TEXT PRIMARY KEY NOT NULL,
-                 canonical_json BLOB NOT NULL,
-                 accountant_csv BLOB NOT NULL,
-                 manifest_json BLOB NOT NULL,
-                 close_hash BLOB NOT NULL UNIQUE
              );
              CREATE TABLE IF NOT EXISTS month_close_revisions (
                  month TEXT NOT NULL,
                  revision INTEGER NOT NULL,
+                 artifact_kind TEXT NOT NULL DEFAULT 'final_close',
                  canonical_json BLOB NOT NULL,
                  accountant_csv BLOB NOT NULL,
                  manifest_json BLOB NOT NULL,
@@ -174,15 +172,21 @@ impl ReceivableStore {
              );
              CREATE TRIGGER IF NOT EXISTS valuations_no_update BEFORE UPDATE ON valuations BEGIN SELECT RAISE(ABORT, 'append_only'); END;
              CREATE TRIGGER IF NOT EXISTS valuations_no_delete BEFORE DELETE ON valuations BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-             CREATE TRIGGER IF NOT EXISTS month_closes_no_update BEFORE UPDATE ON month_closes BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-             CREATE TRIGGER IF NOT EXISTS month_closes_no_delete BEFORE DELETE ON month_closes BEGIN SELECT RAISE(ABORT, 'append_only'); END;
              CREATE TRIGGER IF NOT EXISTS month_close_revisions_no_update BEFORE UPDATE ON month_close_revisions BEGIN SELECT RAISE(ABORT, 'append_only'); END;
              CREATE TRIGGER IF NOT EXISTS month_close_revisions_no_delete BEFORE DELETE ON month_close_revisions BEGIN SELECT RAISE(ABORT, 'append_only'); END;
-             INSERT OR IGNORE INTO month_close_revisions (
-                 month,revision,canonical_json,accountant_csv,manifest_json,close_hash
-             )
-             SELECT month,1,canonical_json,accountant_csv,manifest_json,close_hash
-             FROM month_closes;
+             CREATE TABLE IF NOT EXISTS monthly_export_leases (
+                 month TEXT PRIMARY KEY NOT NULL,
+                 owner TEXT NOT NULL,
+                 expires_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS ledger_checkpoints (
+                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                 previous_checkpoint_hash BLOB,
+                 ledger_root BLOB NOT NULL,
+                 checkpoint_hash BLOB NOT NULL UNIQUE
+             );
+             CREATE TRIGGER IF NOT EXISTS ledger_checkpoints_no_update BEFORE UPDATE ON ledger_checkpoints BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS ledger_checkpoints_no_delete BEFORE DELETE ON ledger_checkpoints BEGIN SELECT RAISE(ABORT, 'append_only'); END;
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
@@ -190,6 +194,9 @@ impl ReceivableStore {
              COMMIT;",
         ).map_err(|_| StoreError::Unavailable)?;
         migrate_state_constraint(&connection)?;
+        migrate_phase_five_schema(&connection)?;
+        initialize_ledger_checkpoints(&connection)?;
+        secure_file(&store.path)?;
         Ok(store)
     }
 
@@ -215,6 +222,7 @@ impl ReceivableStore {
         request: PaymentRequest,
         created_at_unix_ms: i64,
     ) -> Result<StoredReceivable, StoreError> {
+        self.verify_ledger_integrity()?;
         let url = request
             .solana_pay_url()
             .map_err(|_| StoreError::Unavailable)?;
@@ -254,6 +262,7 @@ impl ReceivableStore {
             "INSERT INTO receivable_events (receivable_id,event_schema_version,event_domain,previous_event_hash,canonical_event_bytes,event_hash) VALUES (?1,?2,?3,?4,?5,?6)",
             params![request.receivable_id.as_str(), EVENT_SCHEMA_VERSION, EVENT_DOMAIN, previous, canonical, event_hash],
         ).map_err(|_| StoreError::Unavailable)?;
+        append_ledger_checkpoint(&transaction)?;
         transaction.commit().map_err(|_| StoreError::Unavailable)?;
         Ok(StoredReceivable {
             request,
@@ -270,6 +279,7 @@ impl ReceivableStore {
         &self,
         receivable_id: &ReceivableId,
     ) -> Result<Option<StoredReceivable>, StoreError> {
+        self.verify_ledger_integrity()?;
         find_in(&self.connection()?, receivable_id.as_str())
     }
 
@@ -279,6 +289,7 @@ impl ReceivableStore {
     ///
     /// Returns a redacted storage or integrity error.
     pub fn list_open(&self, limit: usize) -> Result<Vec<StoredReceivable>, StoreError> {
+        self.verify_ledger_integrity()?;
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
@@ -312,6 +323,7 @@ impl ReceivableStore {
         evidence: &SettlementEvidence,
         observed_at_unix_ms: i64,
     ) -> Result<(), StoreError> {
+        self.verify_ledger_integrity()?;
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -382,6 +394,7 @@ impl ReceivableStore {
             )
             .as_bytes(),
         )?;
+        append_ledger_checkpoint(&transaction)?;
         transaction.commit().map_err(|_| StoreError::Unavailable)
     }
 
@@ -399,6 +412,7 @@ impl ReceivableStore {
         candidate_fingerprint: &str,
         observed_at_unix_ms: i64,
     ) -> Result<(), StoreError> {
+        self.verify_ledger_integrity()?;
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -435,6 +449,7 @@ impl ReceivableStore {
             )
             .as_bytes(),
         )?;
+        append_ledger_checkpoint(&transaction)?;
         transaction.commit().map_err(|_| StoreError::Unavailable)
     }
 
@@ -483,6 +498,51 @@ impl ReceivableStore {
         Ok(())
     }
 
+    /// Acquires a per-month export lease, replacing only an expired lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MonthlyExportBusy` while another process owns the month.
+    pub fn acquire_monthly_export_lease(
+        &self,
+        month: &str,
+        owner: &str,
+        now_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        let changed = self
+            .connection()?
+            .execute(
+                "INSERT INTO monthly_export_leases(month,owner,expires_at_unix_ms)
+                 VALUES (?1,?2,?3)
+                 ON CONFLICT(month) DO UPDATE SET owner=excluded.owner,
+                 expires_at_unix_ms=excluded.expires_at_unix_ms
+                 WHERE monthly_export_leases.expires_at_unix_ms <= ?4",
+                params![month, owner, expires_at_unix_ms, now_unix_ms],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::MonthlyExportBusy)
+        }
+    }
+
+    /// Releases only the caller's per-month export lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted storage error.
+    pub fn release_monthly_export_lease(&self, month: &str, owner: &str) -> Result<(), StoreError> {
+        self.connection()?
+            .execute(
+                "DELETE FROM monthly_export_leases WHERE month=?1 AND owner=?2",
+                params![month, owner],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(())
+    }
+
     /// Returns whether a signature or reference already has durable settlement
     /// evidence.
     ///
@@ -494,6 +554,7 @@ impl ReceivableStore {
         signature: &str,
         reference: &Reference,
     ) -> Result<(bool, bool), StoreError> {
+        self.verify_ledger_integrity()?;
         let connection = self.connection()?;
         let signature_used = connection
             .query_row(
@@ -525,6 +586,7 @@ impl ReceivableStore {
         &self,
         receivable_id: &ReceivableId,
     ) -> Result<Option<String>, StoreError> {
+        self.verify_ledger_integrity()?;
         self.connection()?
             .query_row(
                 "SELECT signature FROM settlements WHERE receivable_id = ?1",
@@ -544,6 +606,7 @@ impl ReceivableStore {
         &self,
         receivable_id: &ReceivableId,
     ) -> Result<Option<StoredReviewCandidate>, StoreError> {
+        self.verify_ledger_integrity()?;
         self.connection()?
             .query_row(
                 "SELECT signature,verdict FROM review_candidates WHERE receivable_id = ?1",
@@ -570,6 +633,7 @@ impl ReceivableStore {
         receivable_id: &ReceivableId,
         valuation: &StoredValuation,
     ) -> Result<(), StoreError> {
+        self.verify_ledger_integrity()?;
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -585,11 +649,9 @@ impl ReceivableStore {
         if state.as_deref() != Some("payment_verified") {
             return Err(StoreError::InvalidTransition);
         }
-        let encoded_method = serde_json::to_string(&valuation.valuation_method)
-            .map_err(|_| StoreError::Unavailable)?;
         let existing: Option<(String, String, i64)> = transaction
             .query_row(
-                "SELECT response_sha256,valuation_method_json,brl_reference_cents
+                "SELECT response_sha256,valuation_method,brl_reference_cents
                  FROM valuations WHERE receivable_id = ?1",
                 [receivable_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -598,7 +660,7 @@ impl ReceivableStore {
             .map_err(|_| StoreError::Unavailable)?;
         if let Some((hash, method, cents)) = existing {
             return if hash == valuation.evidence.response_sha256
-                && method == encoded_method
+                && method == NOMINAL_USDC_USD_METHOD
                 && u64::try_from(cents).ok() == Some(valuation.brl_reference_cents)
             {
                 transaction.commit().map_err(|_| StoreError::Unavailable)
@@ -611,7 +673,7 @@ impl ReceivableStore {
                 "INSERT INTO valuations (
                     receivable_id,operation_date,quote_date,purchase,sale,bulletin_type,
                     bulletin_timestamp,retrieved_at_unix_ms,response_sha256,source_id,
-                    policy_version,valuation_method_json,brl_reference_cents
+                    policy_version,valuation_method,brl_reference_cents
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 params![
                     receivable_id.as_str(),
@@ -625,7 +687,7 @@ impl ReceivableStore {
                     valuation.evidence.response_sha256,
                     valuation.evidence.source_id,
                     valuation.evidence.policy_version,
-                    encoded_method,
+                    NOMINAL_USDC_USD_METHOD,
                     i64::try_from(valuation.brl_reference_cents)
                         .map_err(|_| StoreError::Unavailable)?
                 ],
@@ -643,6 +705,7 @@ impl ReceivableStore {
             )
             .as_bytes(),
         )?;
+        append_ledger_checkpoint(&transaction)?;
         transaction.commit().map_err(|_| StoreError::Unavailable)
     }
 
@@ -657,7 +720,7 @@ impl ReceivableStore {
         start_unix: i64,
         end_unix: i64,
     ) -> Result<Vec<StoredSettledReceivable>, StoreError> {
-        self.verify_event_chain()?;
+        self.verify_ledger_integrity()?;
         let connection = self.connection()?;
         let invalid_verified_rows: i64 = connection
             .query_row(
@@ -729,23 +792,23 @@ impl ReceivableStore {
     pub fn record_month_close(
         &self,
         close: StoredMonthClose,
+        expected_ledger_root: &[u8],
     ) -> Result<StoredMonthClose, StoreError> {
-        self.verify_event_chain()?;
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| StoreError::Unavailable)?;
+        verify_ledger_integrity_in(&transaction)?;
+        if ledger_root(&transaction)? != expected_ledger_root {
+            return Err(StoreError::ConcurrentMutation);
+        }
         if let Some(existing) = find_month_close_in(&transaction, &close.month)?
-            && existing == close
+            && same_close_artifacts(&existing, &close)
         {
             transaction.commit().map_err(|_| StoreError::Unavailable)?;
             return Ok(existing);
         }
-        let mut hash_input = close.month.as_bytes().to_vec();
-        hash_input.extend_from_slice(&close.canonical_json);
-        hash_input.extend_from_slice(&close.accountant_csv);
-        hash_input.extend_from_slice(&close.manifest_json);
-        let hash = Sha256::digest(&hash_input).to_vec();
+        let hash = month_close_hash(&close);
         let next_revision: i64 = transaction
             .query_row(
                 "SELECT COALESCE(MAX(revision),0) + 1 FROM month_close_revisions
@@ -757,20 +820,25 @@ impl ReceivableStore {
         transaction
             .execute(
                 "INSERT INTO month_close_revisions (
-                    month,revision,canonical_json,accountant_csv,manifest_json,close_hash
-                 ) VALUES (?1,?2,?3,?4,?5,?6)",
+                    month,revision,artifact_kind,canonical_json,accountant_csv,manifest_json,close_hash
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![
-                    close.month,
+                    &close.month,
                     next_revision,
-                    close.canonical_json,
-                    close.accountant_csv,
-                    close.manifest_json,
+                    &close.artifact_kind,
+                    &close.canonical_json,
+                    &close.accountant_csv,
+                    &close.manifest_json,
                     hash
                 ],
             )
             .map_err(|_| StoreError::Unavailable)?;
+        append_ledger_checkpoint(&transaction)?;
         transaction.commit().map_err(|_| StoreError::Unavailable)?;
-        Ok(close)
+        Ok(StoredMonthClose {
+            revision: u32::try_from(next_revision).map_err(|_| StoreError::Integrity)?,
+            ..close
+        })
     }
 
     /// # Errors
@@ -779,28 +847,62 @@ impl ReceivableStore {
     /// be read from local storage.
     pub fn verify_event_chain(&self) -> Result<(), StoreError> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT previous_event_hash, canonical_event_bytes, event_hash FROM receivable_events ORDER BY sequence").map_err(|_| StoreError::Unavailable)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, Option<Vec<u8>>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            })
-            .map_err(|_| StoreError::Unavailable)?;
-        let mut expected_previous: Option<Vec<u8>> = None;
-        for row in rows {
-            let (previous, canonical, event_hash) = row.map_err(|_| StoreError::Unavailable)?;
-            if previous != expected_previous
-                || Sha256::digest(&canonical).as_slice() != event_hash.as_slice()
-            {
-                return Err(StoreError::Integrity);
-            }
-            expected_previous = Some(event_hash);
-        }
-        Ok(())
+        verify_event_chain_in(&connection)
     }
+
+    /// Returns the verified material-ledger root from one `SQLite` read snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Integrity or storage failures fail closed.
+    pub fn ledger_fingerprint(&self) -> Result<Vec<u8>, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|_| StoreError::Unavailable)?;
+        verify_ledger_integrity_in(&transaction)?;
+        let root = ledger_root(&transaction)?;
+        transaction.commit().map_err(|_| StoreError::Unavailable)?;
+        Ok(root)
+    }
+
+    /// Verifies the event chain, material-table root, and checkpoint chain.
+    ///
+    /// # Errors
+    ///
+    /// Any missing, malformed, or mismatched checkpoint fails closed.
+    pub fn verify_ledger_integrity(&self) -> Result<(), StoreError> {
+        verify_ledger_integrity_in(&self.connection()?)
+    }
+}
+
+fn verify_event_chain_in(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare("SELECT previous_event_hash, canonical_event_bytes, event_hash FROM receivable_events ORDER BY sequence").map_err(|_| StoreError::Unavailable)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<Vec<u8>>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .map_err(|_| StoreError::Unavailable)?;
+    let mut expected_previous: Option<Vec<u8>> = None;
+    for row in rows {
+        let (previous, canonical, event_hash) = row.map_err(|_| StoreError::Unavailable)?;
+        if previous != expected_previous
+            || Sha256::digest(&canonical).as_slice() != event_hash.as_slice()
+        {
+            return Err(StoreError::Integrity);
+        }
+        expected_previous = Some(event_hash);
+    }
+    Ok(())
+}
+
+fn verify_ledger_integrity_in(connection: &Connection) -> Result<(), StoreError> {
+    verify_event_chain_in(connection)?;
+    verify_ledger_checkpoints(connection)
 }
 
 fn find_valuation_in(
@@ -811,7 +913,7 @@ fn find_valuation_in(
         .query_row(
             "SELECT operation_date,quote_date,purchase,sale,bulletin_type,
                     bulletin_timestamp,retrieved_at_unix_ms,response_sha256,source_id,
-                    policy_version,valuation_method_json,brl_reference_cents
+                    policy_version,valuation_method,brl_reference_cents
              FROM valuations WHERE receivable_id = ?1",
             [id],
             |row| {
@@ -848,6 +950,9 @@ fn find_valuation_in(
             method,
             cents,
         )| {
+            if method != NOMINAL_USDC_USD_METHOD {
+                return Err(StoreError::Integrity);
+            }
             Ok(StoredValuation {
                 evidence: PtaxEvidence {
                     operation_date: PtaxDate::parse(operation_date)
@@ -862,8 +967,6 @@ fn find_valuation_in(
                     source_id,
                     policy_version,
                 },
-                valuation_method: serde_json::from_str(&method)
-                    .map_err(|_| StoreError::Integrity)?,
                 brl_reference_cents: u64::try_from(cents).map_err(|_| StoreError::Integrity)?,
             })
         },
@@ -875,23 +978,353 @@ fn find_month_close_in(
     connection: &Connection,
     month: &str,
 ) -> Result<Option<StoredMonthClose>, StoreError> {
-    connection
+    let raw = connection
         .query_row(
-            "SELECT canonical_json,accountant_csv,manifest_json
+            "SELECT revision,artifact_kind,canonical_json,accountant_csv,manifest_json,close_hash
              FROM month_close_revisions WHERE month = ?1
              ORDER BY revision DESC LIMIT 1",
             [month],
             |row| {
-                Ok(StoredMonthClose {
-                    month: month.to_owned(),
-                    canonical_json: row.get(0)?,
-                    accountant_csv: row.get(1)?,
-                    manifest_json: row.get(2)?,
-                })
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
             },
         )
         .optional()
+        .map_err(|_| StoreError::Unavailable)?;
+    raw.map(
+        |(revision, artifact_kind, canonical_json, accountant_csv, manifest_json, hash)| {
+            let close = StoredMonthClose {
+                month: month.to_owned(),
+                revision: u32::try_from(revision).map_err(|_| StoreError::Integrity)?,
+                artifact_kind,
+                canonical_json,
+                accountant_csv,
+                manifest_json,
+            };
+            if hash == month_close_hash(&close) {
+                Ok(close)
+            } else {
+                Err(StoreError::Integrity)
+            }
+        },
+    )
+    .transpose()
+}
+
+fn same_close_artifacts(left: &StoredMonthClose, right: &StoredMonthClose) -> bool {
+    left.month == right.month
+        && left.artifact_kind == right.artifact_kind
+        && left.canonical_json == right.canonical_json
+        && left.accountant_csv == right.accountant_csv
+        && left.manifest_json == right.manifest_json
+}
+
+fn month_close_hash(close: &StoredMonthClose) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, b"recebi.month_close.v2");
+    hash_field(&mut hasher, close.month.as_bytes());
+    hash_field(&mut hasher, close.artifact_kind.as_bytes());
+    hash_field(&mut hasher, &close.canonical_json);
+    hash_field(&mut hasher, &close.accountant_csv);
+    hash_field(&mut hasher, &close.manifest_json);
+    hasher.finalize().to_vec()
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(
+        u64::try_from(value.len())
+            .expect("slice length always fits in u64 on supported targets")
+            .to_be_bytes(),
+    );
+    hasher.update(value);
+}
+
+fn migrate_phase_five_schema(connection: &Connection) -> Result<(), StoreError> {
+    let installed = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version=6",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| StoreError::Unavailable)?
+        .is_some();
+    if installed {
+        return Ok(());
+    }
+    let checkpoints_installed = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version=5",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| StoreError::Unavailable)?
+        .is_some();
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             DROP TRIGGER IF EXISTS valuations_no_update;
+             DROP TRIGGER IF EXISTS valuations_no_delete;
+             DROP TRIGGER IF EXISTS month_close_revisions_no_update;
+             DROP TRIGGER IF EXISTS month_close_revisions_no_delete;",
+        )
+        .map_err(|_| StoreError::Unavailable)?;
+    if column_exists(connection, "valuations", "valuation_method_json")? {
+        connection
+            .execute_batch(
+                "ALTER TABLE valuations RENAME COLUMN valuation_method_json TO valuation_method;",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+    }
+    connection
+        .execute(
+            "UPDATE valuations SET valuation_method=?1
+             WHERE valuation_method=?2 OR valuation_method=?3",
+            params![
+                NOMINAL_USDC_USD_METHOD,
+                r#"{"kind":"nominal_usdc_equals_usd"}"#,
+                r#""nominal_usdc_equals_usd""#
+            ],
+        )
+        .map_err(|_| StoreError::Unavailable)?;
+    if !column_exists(connection, "month_close_revisions", "artifact_kind")? {
+        connection
+            .execute_batch(
+                "ALTER TABLE month_close_revisions
+                 ADD COLUMN artifact_kind TEXT NOT NULL DEFAULT 'legacy_final_close';",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+    }
+    if table_exists(connection, "month_closes")? {
+        connection
+            .execute_batch(
+                "INSERT OR IGNORE INTO month_close_revisions (
+                    month,revision,artifact_kind,canonical_json,accountant_csv,
+                    manifest_json,close_hash
+                 )
+                 SELECT month,1,'legacy_final_close',canonical_json,accountant_csv,
+                        manifest_json,close_hash
+                 FROM month_closes;
+                 DROP TRIGGER IF EXISTS month_closes_no_update;
+                 DROP TRIGGER IF EXISTS month_closes_no_delete;
+                 DROP TABLE month_closes;",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+    }
+    refresh_month_close_hashes(connection)?;
+    if checkpoints_installed {
+        append_ledger_checkpoint(connection)?;
+    }
+    connection
+        .execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS valuations_no_update BEFORE UPDATE ON valuations BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS valuations_no_delete BEFORE DELETE ON valuations BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS month_close_revisions_no_update BEFORE UPDATE ON month_close_revisions BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS month_close_revisions_no_delete BEFORE DELETE ON month_close_revisions BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             INSERT INTO schema_migrations(version) VALUES (6);
+             COMMIT;",
+        )
         .map_err(|_| StoreError::Unavailable)
+}
+
+fn refresh_month_close_hashes(connection: &Connection) -> Result<(), StoreError> {
+    let rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT month,revision,artifact_kind,canonical_json,accountant_csv,manifest_json
+                 FROM month_close_revisions ORDER BY month,revision",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        statement
+            .query_map([], |row| {
+                Ok(StoredMonthClose {
+                    month: row.get(0)?,
+                    revision: u32::try_from(row.get::<_, i64>(1)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    artifact_kind: row.get(2)?,
+                    canonical_json: row.get(3)?,
+                    accountant_csv: row.get(4)?,
+                    manifest_json: row.get(5)?,
+                })
+            })
+            .map_err(|_| StoreError::Unavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::Unavailable)?
+    };
+    for close in rows {
+        connection
+            .execute(
+                "UPDATE month_close_revisions SET close_hash=?1
+                 WHERE month=?2 AND revision=?3",
+                params![
+                    month_close_hash(&close),
+                    close.month,
+                    i64::from(close.revision)
+                ],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+    }
+    Ok(())
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, StoreError> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|value| value.is_some())
+        .map_err(|_| StoreError::Unavailable)
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|_| StoreError::Unavailable)?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|_| StoreError::Unavailable)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| StoreError::Unavailable)?;
+    Ok(names.iter().any(|name| name == column))
+}
+
+fn initialize_ledger_checkpoints(connection: &Connection) -> Result<(), StoreError> {
+    let installed = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version=5",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| StoreError::Unavailable)?
+        .is_some();
+    if installed {
+        return verify_ledger_checkpoints(connection);
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|_| StoreError::Unavailable)?;
+    append_ledger_checkpoint(&transaction)?;
+    transaction
+        .execute("INSERT INTO schema_migrations(version) VALUES (5)", [])
+        .map_err(|_| StoreError::Unavailable)?;
+    transaction.commit().map_err(|_| StoreError::Unavailable)
+}
+
+fn append_ledger_checkpoint(connection: &Connection) -> Result<(), StoreError> {
+    let root = ledger_root(connection)?;
+    let previous: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT checkpoint_hash FROM ledger_checkpoints ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| StoreError::Unavailable)?;
+    let checkpoint_hash = checkpoint_hash(previous.as_deref(), &root);
+    connection
+        .execute(
+            "INSERT INTO ledger_checkpoints (
+                previous_checkpoint_hash,ledger_root,checkpoint_hash
+             ) VALUES (?1,?2,?3)",
+            params![previous, root, checkpoint_hash],
+        )
+        .map_err(|_| StoreError::Unavailable)?;
+    Ok(())
+}
+
+fn verify_ledger_checkpoints(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT previous_checkpoint_hash,ledger_root,checkpoint_hash
+             FROM ledger_checkpoints ORDER BY sequence",
+        )
+        .map_err(|_| StoreError::Unavailable)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<Vec<u8>>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .map_err(|_| StoreError::Unavailable)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| StoreError::Unavailable)?;
+    if rows.is_empty() {
+        return Err(StoreError::Integrity);
+    }
+    let mut previous = None;
+    for (stored_previous, root, hash) in &rows {
+        if stored_previous.as_ref() != previous.as_ref()
+            || *hash != checkpoint_hash(stored_previous.as_deref(), root)
+        {
+            return Err(StoreError::Integrity);
+        }
+        previous = Some(hash.clone());
+    }
+    if rows.last().map(|row| &row.1) != Some(&ledger_root(connection)?) {
+        return Err(StoreError::Integrity);
+    }
+    Ok(())
+}
+
+fn checkpoint_hash(previous: Option<&[u8]>, root: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, b"recebi.ledger_checkpoint.v1");
+    hash_field(&mut hasher, previous.unwrap_or(b"GENESIS"));
+    hash_field(&mut hasher, root);
+    hasher.finalize().to_vec()
+}
+
+fn ledger_root(connection: &Connection) -> Result<Vec<u8>, StoreError> {
+    const QUERIES: [&str; 6] = [
+        "SELECT 'r|'||quote(receivable_id)||'|'||quote(recipient)||'|'||quote(mint)||'|'||quote(atomic_amount)||'|'||quote(decimals)||'|'||quote(reference)||'|'||quote(public_label)||'|'||quote(state)||'|'||quote(created_at_unix_ms)||'|'||quote(solana_pay_url) FROM receivables ORDER BY receivable_id",
+        "SELECT 'e|'||quote(sequence)||'|'||quote(receivable_id)||'|'||quote(event_schema_version)||'|'||quote(event_domain)||'|'||quote(hex(previous_event_hash))||'|'||quote(hex(canonical_event_bytes))||'|'||quote(hex(event_hash)) FROM receivable_events ORDER BY sequence",
+        "SELECT 's|'||quote(receivable_id)||'|'||quote(signature)||'|'||quote(reference)||'|'||quote(slot)||'|'||quote(block_time_unix)||'|'||quote(recipient)||'|'||quote(mint)||'|'||quote(atomic_amount)||'|'||quote(instruction_position)||'|'||quote(fingerprint)||'|'||quote(observed_at_unix_ms) FROM settlements ORDER BY receivable_id",
+        "SELECT 'a|'||quote(receivable_id)||'|'||quote(signature)||'|'||quote(slot)||'|'||quote(verdict)||'|'||quote(candidate_fingerprint)||'|'||quote(observed_at_unix_ms) FROM review_candidates ORDER BY receivable_id",
+        "SELECT 'v|'||quote(receivable_id)||'|'||quote(operation_date)||'|'||quote(quote_date)||'|'||quote(purchase)||'|'||quote(sale)||'|'||quote(bulletin_type)||'|'||quote(bulletin_timestamp)||'|'||quote(retrieved_at_unix_ms)||'|'||quote(response_sha256)||'|'||quote(source_id)||'|'||quote(policy_version)||'|'||quote(valuation_method)||'|'||quote(brl_reference_cents) FROM valuations ORDER BY receivable_id",
+        "SELECT 'c|'||quote(month)||'|'||quote(revision)||'|'||quote(artifact_kind)||'|'||quote(hex(canonical_json))||'|'||quote(hex(accountant_csv))||'|'||quote(hex(manifest_json))||'|'||quote(hex(close_hash)) FROM month_close_revisions ORDER BY month,revision",
+    ];
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, b"recebi.material_ledger.v1");
+    for query in QUERIES {
+        let mut statement = connection
+            .prepare(query)
+            .map_err(|_| StoreError::Unavailable)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| StoreError::Unavailable)?;
+        for row in rows {
+            hash_field(
+                &mut hasher,
+                row.map_err(|_| StoreError::Unavailable)?.as_bytes(),
+            );
+        }
+    }
+    Ok(hasher.finalize().to_vec())
+}
+
+#[cfg(unix)]
+fn secure_file(path: &Path) -> Result<(), StoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|_| StoreError::Unavailable)
+}
+
+#[cfg(not(unix))]
+fn secure_file(_path: &Path) -> Result<(), StoreError> {
+    Ok(())
 }
 
 fn migrate_state_constraint(connection: &Connection) -> Result<(), StoreError> {
@@ -1274,6 +1707,231 @@ mod tests {
         store
             .acquire_reconciliation_lease("owner-c", 250, 350)
             .expect("lease after release");
+    }
+
+    #[test]
+    fn monthly_export_lease_excludes_overlap_by_month_and_allows_expiry() {
+        let directory = tempfile::tempdir().expect("dir");
+        let store = ReceivableStore::open(directory.path().join("recebi.sqlite3")).expect("store");
+        store
+            .acquire_monthly_export_lease("2025-07", "owner-a", 100, 200)
+            .expect("first lease");
+        assert_eq!(
+            store.acquire_monthly_export_lease("2025-07", "owner-b", 150, 250),
+            Err(StoreError::MonthlyExportBusy)
+        );
+        store
+            .acquire_monthly_export_lease("2025-08", "owner-b", 150, 250)
+            .expect("different month");
+        store
+            .acquire_monthly_export_lease("2025-07", "owner-b", 200, 300)
+            .expect("expired replacement");
+        store
+            .release_monthly_export_lease("2025-07", "owner-a")
+            .expect("non-owner release");
+        assert_eq!(
+            store.acquire_monthly_export_lease("2025-07", "owner-c", 250, 350),
+            Err(StoreError::MonthlyExportBusy)
+        );
+        store
+            .release_monthly_export_lease("2025-07", "owner-b")
+            .expect("release");
+    }
+
+    #[test]
+    fn month_close_rejects_a_stale_material_ledger_snapshot() {
+        let directory = tempfile::tempdir().expect("dir");
+        let store = ReceivableStore::open(directory.path().join("recebi.sqlite3")).expect("store");
+        store
+            .create_or_get(request("BEFORE-SNAPSHOT", 7), 100)
+            .expect("first row");
+        let stale_root = store.ledger_fingerprint().expect("snapshot root");
+        store
+            .create_or_get(request("AFTER-SNAPSHOT", 8), 101)
+            .expect("concurrent row");
+        assert_eq!(
+            store.record_month_close(
+                StoredMonthClose {
+                    month: "2025-07".to_owned(),
+                    revision: 0,
+                    artifact_kind: "final_close".to_owned(),
+                    canonical_json: b"{}\n".to_vec(),
+                    accountant_csv: b"a,b\n".to_vec(),
+                    manifest_json: b"{}\n".to_vec(),
+                },
+                &stale_root,
+            ),
+            Err(StoreError::ConcurrentMutation)
+        );
+    }
+
+    #[test]
+    fn material_row_tampering_is_detected_for_settlement_valuation_and_close() {
+        for target in ["settlement", "valuation", "close"] {
+            let directory = tempfile::tempdir().expect("dir");
+            let path = directory.path().join("recebi.sqlite3");
+            let store = ReceivableStore::open(&path).expect("store");
+            let stored = store
+                .create_or_get(request("MATERIAL", 7), 100)
+                .expect("create");
+            store
+                .mark_payment_verified(
+                    &stored.request.receivable_id,
+                    &stored.request.reference,
+                    &evidence(&stored.request, 9),
+                    200,
+                )
+                .expect("settle");
+            store
+                .attach_valuation(
+                    &stored.request.receivable_id,
+                    &StoredValuation {
+                        evidence: PtaxEvidence {
+                            operation_date: PtaxDate::parse("2023-11-14").expect("date"),
+                            quote_date: PtaxDate::parse("2023-11-14").expect("date"),
+                            purchase: "4.85000".to_owned(),
+                            sale: "4.85100".to_owned(),
+                            bulletin_type: None,
+                            bulletin_timestamp: "2023-11-14 13:00:00".to_owned(),
+                            retrieved_at_unix_ms: 300,
+                            response_sha256: "ab".repeat(32),
+                            source_id: "bcb".to_owned(),
+                            policy_version: "strict_same_day_closing_v1".to_owned(),
+                        },
+                        brl_reference_cents: 49,
+                    },
+                )
+                .expect("valuation");
+            let root = store.ledger_fingerprint().expect("ledger root");
+            store
+                .record_month_close(
+                    StoredMonthClose {
+                        month: "2023-11".to_owned(),
+                        revision: 0,
+                        artifact_kind: "final_close".to_owned(),
+                        canonical_json: b"{}\n".to_vec(),
+                        accountant_csv: b"a,b\n".to_vec(),
+                        manifest_json: b"{}\n".to_vec(),
+                    },
+                    &root,
+                )
+                .expect("close");
+            let connection = Connection::open(&path).expect("connection");
+            match target {
+                "settlement" => {
+                    connection
+                        .execute("UPDATE settlements SET atomic_amount=atomic_amount+1", [])
+                        .expect("tamper settlement");
+                }
+                "valuation" => connection
+                    .execute_batch(
+                        "DROP TRIGGER valuations_no_update;
+                         UPDATE valuations SET sale='9.99999';",
+                    )
+                    .expect("tamper valuation"),
+                "close" => connection
+                    .execute_batch(
+                        "DROP TRIGGER month_close_revisions_no_update;
+                         UPDATE month_close_revisions SET canonical_json=x'00';",
+                    )
+                    .expect("tamper close"),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                store.verify_ledger_integrity(),
+                Err(StoreError::Integrity),
+                "{target} tamper must fail closed"
+            );
+            assert_eq!(
+                store.get(&stored.request.receivable_id),
+                Err(StoreError::Integrity),
+                "{target} tamper must also fail a normal agent read"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_five_schema_migrates_once_and_removes_legacy_table() {
+        let directory = tempfile::tempdir().expect("dir");
+        let path = directory.path().join("recebi.sqlite3");
+        let connection = Connection::open(&path).expect("connection");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                 INSERT INTO schema_migrations(version) VALUES (1),(2),(3),(4);
+                 CREATE TABLE valuations (
+                    receivable_id TEXT PRIMARY KEY NOT NULL,
+                    operation_date TEXT NOT NULL, quote_date TEXT NOT NULL,
+                    purchase TEXT NOT NULL, sale TEXT NOT NULL,
+                    bulletin_type TEXT, bulletin_timestamp TEXT NOT NULL,
+                    retrieved_at_unix_ms INTEGER NOT NULL,
+                    response_sha256 TEXT NOT NULL, source_id TEXT NOT NULL,
+                    policy_version TEXT NOT NULL,
+                    valuation_method_json TEXT NOT NULL,
+                    brl_reference_cents INTEGER NOT NULL
+                 );
+                 CREATE TABLE month_closes (
+                    month TEXT PRIMARY KEY NOT NULL, canonical_json BLOB NOT NULL,
+                    accountant_csv BLOB NOT NULL, manifest_json BLOB NOT NULL,
+                    close_hash BLOB NOT NULL UNIQUE
+                 );
+                 CREATE TABLE month_close_revisions (
+                    month TEXT NOT NULL, revision INTEGER NOT NULL,
+                    canonical_json BLOB NOT NULL, accountant_csv BLOB NOT NULL,
+                    manifest_json BLOB NOT NULL, close_hash BLOB NOT NULL UNIQUE,
+                    PRIMARY KEY(month,revision)
+                 );
+                 INSERT INTO month_closes VALUES ('2025-07',x'7b7d',x'612c62',x'7b7d',x'00');",
+            )
+            .expect("legacy schema");
+        drop(connection);
+
+        ReceivableStore::open(&path).expect("migrate");
+        ReceivableStore::open(&path).expect("reopen without rerunning migration");
+        let connection = Connection::open(&path).expect("connection");
+        assert!(!table_exists(&connection, "month_closes").expect("table check"));
+        assert!(column_exists(&connection, "valuations", "valuation_method").expect("column"));
+        assert!(
+            column_exists(&connection, "month_close_revisions", "artifact_kind").expect("column")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT artifact_kind FROM month_close_revisions WHERE month='2025-07'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("legacy close"),
+            "legacy_final_close"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version IN (5,6)",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("migration versions"),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_permissions_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("dir");
+        let path = directory.path().join("recebi.sqlite3");
+        ReceivableStore::open(&path).expect("store");
+        assert_eq!(
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]

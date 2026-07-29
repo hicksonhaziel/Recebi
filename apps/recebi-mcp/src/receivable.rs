@@ -109,7 +109,9 @@ fn map_store_error(error: &StoreError) -> CreateRequestError {
         | StoreError::Integrity
         | StoreError::InvalidTransition
         | StoreError::Replay
-        | StoreError::ReconciliationBusy => CreateRequestError::StorageUnavailable,
+        | StoreError::ReconciliationBusy
+        | StoreError::MonthlyExportBusy
+        | StoreError::ConcurrentMutation => CreateRequestError::StorageUnavailable,
     }
 }
 

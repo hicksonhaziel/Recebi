@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::health::HealthService;
 use crate::receivable::{CreateRequestInput, ReceivableService};
 use crate::{
-    close_month::{CloseMonthInput, CloseMonthService},
+    close_month::{CloseMonthInput, CloseMonthService, SnapshotMonthInput},
     ptax::HttpBcbPtax,
     reconcile::{CheckInput, ReconcileOpenInput, ReconciliationService},
     rpc::HttpSolanaRpc,
@@ -98,6 +98,7 @@ fn dispatch(
                 create_request_tool_schema(),
                 check_tool_schema(),
                 reconcile_open_tool_schema(),
+                snapshot_month_tool_schema(),
                 close_month_tool_schema()
             ]}),
         ),
@@ -134,8 +135,23 @@ fn call_tool(
             call_reconcile_open(reconciliation, id, params.get("arguments"))
         }
         Some("recebi_close_month") => call_close_month(closing, id, params.get("arguments")),
+        Some("recebi_snapshot_month") => call_snapshot_month(closing, id, params.get("arguments")),
         _ => error_response(id, -32602, "unknown_tool"),
     }
+}
+
+fn call_snapshot_month(
+    closing: &CloseMonthService<HttpBcbPtax>,
+    id: &Value,
+    arguments: Option<&Value>,
+) -> Value {
+    let Some(arguments) = arguments else {
+        return error_response(id, -32602, "invalid_snapshot_month_arguments");
+    };
+    let Ok(input) = serde_json::from_value::<SnapshotMonthInput>(arguments.clone()) else {
+        return error_response(id, -32602, "invalid_snapshot_month_arguments");
+    };
+    tool_result(id, closing.snapshot(&input))
 }
 
 fn call_close_month(
@@ -149,7 +165,7 @@ fn call_close_month(
     let Ok(input) = serde_json::from_value::<CloseMonthInput>(arguments.clone()) else {
         return error_response(id, -32602, "invalid_close_month_arguments");
     };
-    tool_result(id, closing.close(input))
+    tool_result(id, closing.close(&input))
 }
 
 fn call_check(
@@ -283,7 +299,26 @@ fn create_request_tool_schema() -> Value {
 fn close_month_tool_schema() -> Value {
     json!({
         "name": "recebi_close_month",
-        "description": "Attach bounded official same-day BCB PTAX evidence where available and create deterministic accountant-ready monthly JSON/CSV/manifest files. A missing quote never changes verified payment status.",
+        "description": "Finalize a completed UTC month, attach bounded official same-day BCB PTAX evidence where available, and atomically publish deterministic accountant-ready JSON/CSV/manifest files. The active or a future month is rejected.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "month": {
+                    "type": "string",
+                    "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])$",
+                    "description": "UTC settlement month in YYYY-MM form."
+                }
+            },
+            "required": ["month"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn snapshot_month_tool_schema() -> Value {
+    json!({
+        "name": "recebi_snapshot_month",
+        "description": "Create a provisional, hash-verified snapshot for the active or a completed UTC month without calling it a final close. A future month is rejected.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -356,7 +391,7 @@ mod tests {
 
     use super::{
         close_month_tool_schema, create_request_tool_schema, dispatch, encode_response,
-        health_tool_schema,
+        health_tool_schema, snapshot_month_tool_schema,
     };
     use crate::{
         close_month::CloseMonthService, config::AppConfig, health::HealthService,
@@ -419,6 +454,9 @@ max_open_reconcile = 10
         let close_schema = close_month_tool_schema();
         assert_eq!(close_schema["name"], "recebi_close_month");
         assert_eq!(close_schema["inputSchema"]["required"], json!(["month"]));
+        let snapshot_schema = snapshot_month_tool_schema();
+        assert_eq!(snapshot_schema["name"], "recebi_snapshot_month");
+        assert_eq!(snapshot_schema["inputSchema"]["required"], json!(["month"]));
     }
 
     #[test]
