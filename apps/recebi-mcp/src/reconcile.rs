@@ -6,7 +6,7 @@ use std::{
 
 use getrandom::fill;
 use recebi_core::{
-    ReceivableId, ReceivableState, ReviewResolutionAction, SettlementAssessment,
+    GenesisHash, ReceivableId, ReceivableState, ReviewResolutionAction, SettlementAssessment,
     SettlementExpectation, SettlementVerdict, UnderpaymentEvidence, VarianceReason,
     assess_settlement_once, decode_transaction,
     limits::{MAX_ANOMALY_SAMPLES, MAX_RECONCILE_RECEIVABLES},
@@ -88,7 +88,9 @@ pub struct ReconcileOpenResult {
     pub payment_verified: usize,
     pub pending: usize,
     pub needs_review: usize,
+    pub incomplete: usize,
     pub anomaly_samples: Vec<String>,
+    pub incomplete_samples: Vec<String>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -151,6 +153,15 @@ impl<R: SolanaRpc> ReconciliationService<R> {
     // Keep every persisted state mapped explicitly to its externally visible
     // result so a new state cannot silently inherit another state's meaning.
     fn check_id(&self, id: &ReceivableId) -> Result<CheckResult, ReconcileError> {
+        self.check_id_with_genesis(id, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn check_id_with_genesis(
+        &self,
+        id: &ReceivableId,
+        observed_genesis: Option<&GenesisHash>,
+    ) -> Result<CheckResult, ReconcileError> {
         let stored = self
             .store
             .get(id)
@@ -251,13 +262,19 @@ impl<R: SolanaRpc> ReconciliationService<R> {
             ReceivableState::Open => {}
             _ => return Err(ReconcileError::StorageUnavailable),
         }
-        self.check_open(&stored)
+        self.check_open(&stored, observed_genesis)
     }
 
     #[allow(clippy::too_many_lines)] // Keep the ordered fail-closed verification path auditable.
-    fn check_open(&self, stored: &StoredReceivable) -> Result<CheckResult, ReconcileError> {
+    fn check_open(
+        &self,
+        stored: &StoredReceivable,
+        observed_genesis: Option<&GenesisHash>,
+    ) -> Result<CheckResult, ReconcileError> {
         let expected_genesis = self.config.recebi.genesis_hash.clone();
-        let observed_genesis = self.rpc.genesis_hash().map_err(map_rpc)?;
+        let observed_genesis = observed_genesis
+            .cloned()
+            .map_or_else(|| self.rpc.genesis_hash().map_err(map_rpc), Ok)?;
         if observed_genesis != expected_genesis {
             return Err(ReconcileError::WrongCluster);
         }
@@ -543,11 +560,40 @@ impl<R: SolanaRpc> ReconciliationService<R> {
             payment_verified: 0,
             pending: 0,
             needs_review: 0,
+            incomplete: 0,
             anomaly_samples: vec![],
+            incomplete_samples: vec![],
+        };
+        if open.is_empty() {
+            return Ok(result);
+        }
+        let expected_genesis = self.config.recebi.genesis_hash.clone();
+        let observed_genesis = match self.rpc.genesis_hash() {
+            Ok(genesis) if genesis == expected_genesis => Some(genesis),
+            Ok(_) => return Err(ReconcileError::WrongCluster),
+            Err(_) => None,
         };
         for receivable in open {
-            let checked = self.check_id(&receivable.request.receivable_id)?;
             result.checked += 1;
+            let checked = match observed_genesis.as_ref() {
+                Some(genesis) => {
+                    self.check_id_with_genesis(&receivable.request.receivable_id, Some(genesis))
+                }
+                None => Err(ReconcileError::RpcIncomplete),
+            };
+            let checked = match checked {
+                Ok(checked) => checked,
+                Err(ReconcileError::RpcIncomplete | ReconcileError::MalformedEvidence) => {
+                    result.incomplete += 1;
+                    if result.incomplete_samples.len() < MAX_ANOMALY_SAMPLES {
+                        result
+                            .incomplete_samples
+                            .push(receivable.request.receivable_id.as_str().to_owned());
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             match checked.status {
                 CheckStatus::PaymentVerified => result.payment_verified += 1,
                 CheckStatus::Pending => result.pending += 1,
@@ -1093,6 +1139,30 @@ max_open_reconcile = 10
             })
             .expect("check");
         assert_eq!(result.status, CheckStatus::Pending);
+        assert_open(&service, &id);
+    }
+
+    #[test]
+    fn scheduled_reconcile_reports_bounded_counts_and_keeps_transient_rpc_unknown() {
+        let (_directory, mut service, id) = setup(100_000, false);
+        service.rpc.candidates.clear();
+        let result = service
+            .reconcile_open(ReconcileOpenInput { max_count: Some(1) })
+            .expect("scheduled pass");
+        assert_eq!(result.checked, 1);
+        assert_eq!(result.pending, 1);
+        assert_eq!(result.payment_verified, 0);
+        assert_eq!(result.needs_review, 0);
+        assert_eq!(result.incomplete, 0);
+
+        service.rpc.genesis_error = Some(RpcError::Transport);
+        let incomplete = service
+            .reconcile_open(ReconcileOpenInput { max_count: Some(1) })
+            .expect("incomplete pass is reported, not inferred");
+        assert_eq!(incomplete.checked, 1);
+        assert_eq!(incomplete.incomplete, 1);
+        assert_eq!(incomplete.incomplete_samples, vec![id.as_str().to_owned()]);
+        assert_eq!(incomplete.payment_verified, 0);
         assert_open(&service, &id);
     }
 

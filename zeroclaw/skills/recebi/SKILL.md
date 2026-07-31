@@ -78,8 +78,13 @@ translate identifiers, signatures, hashes, reasons, or action names.
 
 Use `recebi__recebi_reconcile_open` only for an operator-requested or scheduled
 bounded scan. Pass no arguments or a `max_count` no greater than 10. Report the
-four counts and at most the returned anomaly IDs. Do not retry automatically,
-fetch raw RPC data, inspect transaction memos, or infer settlement from chat.
+checked, payment_verified, pending, needs_review, and incomplete counts plus at
+most the returned anomaly and incomplete IDs. An incomplete record means its
+status is unknown and must not be called paid. For a scheduled run, report a
+compact alert when payment_verified, needs_review, or incomplete is non-zero;
+when all three are zero, return exactly `NO_REPLY[INFO]: no new Recebi
+activity`. Do not retry automatically, fetch raw RPC data, inspect transaction
+memos, or infer settlement from chat.
 
 Use `recebi__recebi_snapshot_month` when the operator asks for a report,
 preview, or export of the active UTC month. Pass exactly `month` in `YYYY-MM`
