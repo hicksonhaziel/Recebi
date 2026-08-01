@@ -9,7 +9,10 @@ use crate::receivable::{CreateRequestInput, ReceivableService};
 use crate::{
     close_month::{CloseMonthInput, CloseMonthService, SnapshotMonthInput},
     ptax::HttpBcbPtax,
-    reconcile::{CheckInput, ReconcileOpenInput, ReconciliationService, ResolveReviewInput},
+    reconcile::{
+        CheckInput, ReconcileOpenInput, ReconciliationService, ResolveReviewInput,
+        WatchPaymentInput,
+    },
     rpc::HttpSolanaRpc,
 };
 
@@ -97,6 +100,7 @@ fn dispatch(
                 health_tool_schema(),
                 create_request_tool_schema(),
                 check_tool_schema(),
+                watch_payment_tool_schema(),
                 reconcile_open_tool_schema(),
                 snapshot_month_tool_schema(),
                 close_month_tool_schema()
@@ -131,6 +135,9 @@ fn call_tool(
             call_create_request(receivables, id, params.get("arguments"))
         }
         Some("recebi_check") => call_check(reconciliation, id, params.get("arguments")),
+        Some("recebi_watch_payment") => {
+            call_watch_payment(reconciliation, id, params.get("arguments"))
+        }
         Some("recebi_reconcile_open") => {
             call_reconcile_open(reconciliation, id, params.get("arguments"))
         }
@@ -197,6 +204,20 @@ fn call_check(
         return error_response(id, -32602, "invalid_check_arguments");
     };
     tool_result(id, reconciliation.check(input))
+}
+
+fn call_watch_payment(
+    reconciliation: &ReconciliationService<HttpSolanaRpc>,
+    id: &Value,
+    arguments: Option<&Value>,
+) -> Value {
+    let Some(arguments) = arguments else {
+        return error_response(id, -32602, "invalid_watch_payment_arguments");
+    };
+    let Ok(input) = serde_json::from_value::<WatchPaymentInput>(arguments.clone()) else {
+        return error_response(id, -32602, "invalid_watch_payment_arguments");
+    };
+    tool_result(id, reconciliation.watch_payment(input))
 }
 
 fn call_reconcile_open(
@@ -366,6 +387,22 @@ fn check_tool_schema() -> Value {
     })
 }
 
+fn watch_payment_tool_schema() -> Value {
+    json!({
+        "name": "recebi_watch_payment",
+        "description": "Run one stock-ZeroClaw-safe watch window for an expected receivable. Each window checks finalized Solana evidence immediately and once more after 10 seconds. Start with window 1 and increment only when outcome is continue, up to window 4. Stop immediately on any other outcome. It never signs or submits.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "receivable_id": {"type": "string", "maxLength": 64},
+                "window": {"type": "integer", "minimum": 1, "maximum": 4}
+            },
+            "required": ["receivable_id", "window"],
+            "additionalProperties": false
+        }
+    })
+}
+
 fn reconcile_open_tool_schema() -> Value {
     json!({
         "name": "recebi_reconcile_open",
@@ -408,7 +445,7 @@ mod tests {
 
     use super::{
         close_month_tool_schema, create_request_tool_schema, dispatch, encode_response,
-        health_tool_schema, snapshot_month_tool_schema,
+        health_tool_schema, snapshot_month_tool_schema, watch_payment_tool_schema,
     };
     use crate::{
         close_month::CloseMonthService, config::AppConfig, health::HealthService,
@@ -474,6 +511,19 @@ max_open_reconcile = 10
         let snapshot_schema = snapshot_month_tool_schema();
         assert_eq!(snapshot_schema["name"], "recebi_snapshot_month");
         assert_eq!(snapshot_schema["inputSchema"]["required"], json!(["month"]));
+        let watch_schema = watch_payment_tool_schema();
+        assert_eq!(watch_schema["name"], "recebi_watch_payment");
+        assert_eq!(
+            watch_schema["inputSchema"]["required"],
+            json!(["receivable_id", "window"])
+        );
+        assert_eq!(
+            watch_schema["inputSchema"]["properties"]
+                .as_object()
+                .expect("properties")
+                .len(),
+            2
+        );
         let (_directory, health, receivables, reconciliation, closing) = services();
         let listed = dispatch(
             &health,
@@ -536,6 +586,33 @@ max_open_reconcile = 10
         assert_eq!(
             result["error"]["message"],
             "invalid_create_request_arguments"
+        );
+    }
+
+    #[test]
+    fn watch_rejects_model_supplied_polling_policy() {
+        let (_directory, health, receivables, reconciliation, closing) = services();
+        let result = dispatch(
+            &health,
+            &receivables,
+            &reconciliation,
+            &closing,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "recebi_watch_payment",
+                    "arguments": {
+                        "receivable_id": "ACME-412",
+                        "poll_interval_seconds": 1,
+                        "max_polls": 1000,
+                        "rpc_url": "https://attacker.invalid"
+                    }
+                },
+            }),
+        );
+        assert_eq!(
+            result["error"]["message"],
+            "invalid_watch_payment_arguments"
         );
     }
 

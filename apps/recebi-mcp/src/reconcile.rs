@@ -1,7 +1,8 @@
 use std::{
     collections::HashSet,
     fmt::Write,
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use getrandom::fill;
@@ -22,11 +23,21 @@ use crate::{
 };
 
 const LEASE_DURATION_MS: i64 = 60_000;
+const WATCH_INTERVAL: Duration = Duration::from_secs(10);
+const WATCH_POLLS_PER_WINDOW: u8 = 2;
+const WATCH_MAX_WINDOWS: u8 = 4;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckInput {
     pub receivable_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchPaymentInput {
+    pub receivable_id: String,
+    pub window: u8,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -67,6 +78,26 @@ pub struct CheckResult {
     pub shortfall_amount: Option<String>,
     pub variance_eligible: bool,
     pub variance_reason: Option<VarianceReason>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchOutcome {
+    Terminal,
+    Continue,
+    PendingTimeout,
+    IncompleteTimeout,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WatchPaymentResult {
+    pub receivable_id: String,
+    pub window: u8,
+    pub outcome: WatchOutcome,
+    pub polls: u8,
+    pub incomplete_polls: u8,
+    pub poll_interval_seconds: u64,
+    pub last_observation: Option<CheckResult>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -147,6 +178,159 @@ impl<R: SolanaRpc> ReconciliationService<R> {
         let id =
             ReceivableId::new(input.receivable_id).map_err(|_| ReconcileError::InvalidInput)?;
         self.check_id(&id)
+    }
+
+    /// Watch one expected receivable for a short, bounded settlement window.
+    ///
+    /// The model may bridge bounded numbered windows. Polling within each
+    /// window, cluster validation, state transitions, and stopping conditions
+    /// stay inside deterministic Rust.
+    pub fn watch_payment(
+        &self,
+        input: WatchPaymentInput,
+    ) -> Result<WatchPaymentResult, ReconcileError> {
+        self.watch_payment_with(input, thread::sleep)
+    }
+
+    fn watch_payment_with<F>(
+        &self,
+        input: WatchPaymentInput,
+        sleep_between: F,
+    ) -> Result<WatchPaymentResult, ReconcileError>
+    where
+        F: FnMut(Duration),
+    {
+        if !(1..=WATCH_MAX_WINDOWS).contains(&input.window) {
+            return Err(ReconcileError::InvalidInput);
+        }
+        let id =
+            ReceivableId::new(input.receivable_id).map_err(|_| ReconcileError::InvalidInput)?;
+        let mut result =
+            self.watch_id_with(&id, WATCH_POLLS_PER_WINDOW, WATCH_INTERVAL, sleep_between)?;
+        result.window = input.window;
+        if input.window < WATCH_MAX_WINDOWS
+            && matches!(
+                result.outcome,
+                WatchOutcome::PendingTimeout | WatchOutcome::IncompleteTimeout
+            )
+        {
+            result.outcome = WatchOutcome::Continue;
+        }
+        Ok(result)
+    }
+
+    fn watch_id_with<F>(
+        &self,
+        id: &ReceivableId,
+        max_polls: u8,
+        interval: Duration,
+        sleep_between: F,
+    ) -> Result<WatchPaymentResult, ReconcileError>
+    where
+        F: FnMut(Duration),
+    {
+        if max_polls == 0 {
+            return Err(ReconcileError::InvalidInput);
+        }
+        let mut owner_bytes = [0_u8; 16];
+        fill(&mut owner_bytes).map_err(|_| ReconcileError::StorageUnavailable)?;
+        let owner = bs58::encode(owner_bytes).into_string();
+        let now = now_unix_ms()?;
+        self.store
+            .acquire_reconciliation_lease(&owner, now, now + LEASE_DURATION_MS)
+            .map_err(|error| map_store(&error))?;
+        let result = self.watch_id_acquired(id, max_polls, interval, sleep_between);
+        let released = self
+            .store
+            .release_reconciliation_lease(&owner)
+            .map_err(|error| map_store(&error));
+        match (result, released) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+
+    fn watch_id_acquired<F>(
+        &self,
+        id: &ReceivableId,
+        max_polls: u8,
+        interval: Duration,
+        mut sleep_between: F,
+    ) -> Result<WatchPaymentResult, ReconcileError>
+    where
+        F: FnMut(Duration),
+    {
+        let stored = self
+            .store
+            .get(id)
+            .map_err(|error| map_store(&error))?
+            .ok_or(ReconcileError::NotFound)?;
+        if stored.state != ReceivableState::Open {
+            return Ok(watch_terminal(
+                self.check_id_with_genesis(id, None)?,
+                1,
+                0,
+                interval,
+            ));
+        }
+
+        let expected_genesis = self.config.recebi.genesis_hash.clone();
+        let mut observed_genesis = None;
+        let mut last_observation = None;
+        let mut incomplete_polls = 0_u8;
+        let mut final_poll_complete = false;
+
+        for poll in 1..=max_polls {
+            if observed_genesis.is_none() {
+                match self.rpc.genesis_hash() {
+                    Ok(genesis) if genesis == expected_genesis => observed_genesis = Some(genesis),
+                    Ok(_) => return Err(ReconcileError::WrongCluster),
+                    Err(_) => {
+                        incomplete_polls = incomplete_polls.saturating_add(1);
+                        final_poll_complete = false;
+                        if poll < max_polls {
+                            sleep_between(interval);
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            match self.check_id_with_genesis(id, observed_genesis.as_ref()) {
+                Ok(checked) if checked.status != CheckStatus::Pending => {
+                    return Ok(watch_terminal(checked, poll, incomplete_polls, interval));
+                }
+                Ok(checked) => {
+                    last_observation = Some(checked);
+                    final_poll_complete = true;
+                }
+                Err(ReconcileError::RpcIncomplete) => {
+                    incomplete_polls = incomplete_polls.saturating_add(1);
+                    final_poll_complete = false;
+                }
+                Err(ReconcileError::MalformedEvidence) => {
+                    return Err(ReconcileError::MalformedEvidence);
+                }
+                Err(error) => return Err(error),
+            }
+            if poll < max_polls {
+                sleep_between(interval);
+            }
+        }
+
+        Ok(WatchPaymentResult {
+            receivable_id: id.as_str().to_owned(),
+            window: 0,
+            outcome: if final_poll_complete {
+                WatchOutcome::PendingTimeout
+            } else {
+                WatchOutcome::IncompleteTimeout
+            },
+            polls: max_polls,
+            incomplete_polls,
+            poll_interval_seconds: interval.as_secs(),
+            last_observation,
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -638,6 +822,23 @@ fn pending_result(receivable_id: &ReceivableId) -> CheckResult {
     }
 }
 
+fn watch_terminal(
+    checked: CheckResult,
+    polls: u8,
+    incomplete_polls: u8,
+    interval: Duration,
+) -> WatchPaymentResult {
+    WatchPaymentResult {
+        receivable_id: checked.receivable_id.clone(),
+        window: 0,
+        outcome: WatchOutcome::Terminal,
+        polls,
+        incomplete_polls,
+        poll_interval_seconds: interval.as_secs(),
+        last_observation: Some(checked),
+    }
+}
+
 fn map_rpc(_error: RpcError) -> ReconcileError {
     ReconcileError::RpcIncomplete
 }
@@ -704,7 +905,7 @@ fn anomaly_fingerprint(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{cell::Cell, collections::HashMap, sync::Arc};
 
     use recebi_core::{
         AtomicAmount, BoundedText, GenesisHash, PaymentRequest, PublicKey, RawTokenAccount,
@@ -1143,6 +1344,136 @@ max_open_reconcile = 10
     }
 
     #[test]
+    fn expected_payment_watch_stops_immediately_on_terminal_state() {
+        let (_directory, service, id) = setup(100_000, false);
+        let sleeps = Cell::new(0_u8);
+        let result = service
+            .watch_id_with(&id, 3, Duration::ZERO, |_| sleeps.set(sleeps.get() + 1))
+            .expect("watch");
+        assert_eq!(result.outcome, WatchOutcome::Terminal);
+        assert_eq!(result.polls, 1);
+        assert_eq!(result.incomplete_polls, 0);
+        assert_eq!(sleeps.get(), 0);
+        assert_eq!(
+            result.last_observation.expect("observation").status,
+            CheckStatus::PaymentVerified
+        );
+    }
+
+    #[test]
+    fn expected_payment_watch_is_bounded_when_payment_is_pending() {
+        let (_directory, mut service, id) = setup(100_000, false);
+        service.rpc.candidates.clear();
+        let sleeps = Cell::new(0_u8);
+        let result = service
+            .watch_id_with(&id, 3, Duration::ZERO, |_| sleeps.set(sleeps.get() + 1))
+            .expect("watch");
+        assert_eq!(result.outcome, WatchOutcome::PendingTimeout);
+        assert_eq!(result.polls, 3);
+        assert_eq!(result.incomplete_polls, 0);
+        assert_eq!(sleeps.get(), 2);
+        assert_eq!(
+            result.last_observation.expect("observation").status,
+            CheckStatus::Pending
+        );
+        assert_open(&service, &id);
+    }
+
+    #[test]
+    fn stock_host_watch_windows_continue_then_stop_at_the_rust_cap() {
+        let (_directory, mut service, id) = setup(100_000, false);
+        service.rpc.candidates.clear();
+        let first = service
+            .watch_payment_with(
+                WatchPaymentInput {
+                    receivable_id: id.as_str().to_owned(),
+                    window: 1,
+                },
+                |_| {},
+            )
+            .expect("first window");
+        assert_eq!(first.window, 1);
+        assert_eq!(first.polls, WATCH_POLLS_PER_WINDOW);
+        assert_eq!(first.outcome, WatchOutcome::Continue);
+
+        let final_window = service
+            .watch_payment_with(
+                WatchPaymentInput {
+                    receivable_id: id.as_str().to_owned(),
+                    window: WATCH_MAX_WINDOWS,
+                },
+                |_| {},
+            )
+            .expect("final window");
+        assert_eq!(final_window.window, WATCH_MAX_WINDOWS);
+        assert_eq!(final_window.outcome, WatchOutcome::PendingTimeout);
+        assert_open(&service, &id);
+    }
+
+    #[test]
+    fn stock_host_watch_rejects_a_window_outside_the_rust_cap() {
+        let (_directory, service, id) = setup(100_000, false);
+        assert_eq!(
+            service.watch_payment_with(
+                WatchPaymentInput {
+                    receivable_id: id.as_str().to_owned(),
+                    window: WATCH_MAX_WINDOWS + 1,
+                },
+                |_| {},
+            ),
+            Err(ReconcileError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn expected_payment_watch_never_turns_rpc_failure_into_pending_or_paid() {
+        let (_directory, mut service, id) = setup(100_000, false);
+        service.rpc.genesis_error = Some(RpcError::Transport);
+        let result = service
+            .watch_id_with(&id, 3, Duration::ZERO, |_| {})
+            .expect("bounded incomplete watch");
+        assert_eq!(result.outcome, WatchOutcome::IncompleteTimeout);
+        assert_eq!(result.polls, 3);
+        assert_eq!(result.incomplete_polls, 3);
+        assert!(result.last_observation.is_none());
+        assert_open(&service, &id);
+    }
+
+    #[test]
+    fn expected_payment_watch_does_not_retry_malformed_evidence() {
+        let (_directory, mut service, id) = setup(100_000, false);
+        service.rpc.candidates[0].block_time_unix = None;
+        let sleeps = Cell::new(0_u8);
+        assert_eq!(
+            service.watch_id_with(&id, 3, Duration::ZERO, |_| {
+                sleeps.set(sleeps.get() + 1);
+            }),
+            Err(ReconcileError::MalformedEvidence)
+        );
+        assert_eq!(sleeps.get(), 0);
+        assert_open(&service, &id);
+    }
+
+    #[test]
+    fn expected_payment_watch_reads_an_already_terminal_state_without_rpc() {
+        let (_directory, mut service, id) = setup(100_000, false);
+        service
+            .check(CheckInput {
+                receivable_id: id.as_str().to_owned(),
+            })
+            .expect("settle");
+        service.rpc.genesis_error = Some(RpcError::Transport);
+        let result = service
+            .watch_id_with(&id, 3, Duration::ZERO, |_| {})
+            .expect("terminal state");
+        assert_eq!(result.outcome, WatchOutcome::Terminal);
+        assert_eq!(
+            result.last_observation.expect("observation").status,
+            CheckStatus::PaymentVerified
+        );
+    }
+
+    #[test]
     fn scheduled_reconcile_reports_bounded_counts_and_keeps_transient_rpc_unknown() {
         let (_directory, mut service, id) = setup(100_000, false);
         service.rpc.candidates.clear();
@@ -1211,6 +1542,20 @@ max_open_reconcile = 10
             .expect("lease");
         assert!(matches!(
             service.reconcile_open(ReconcileOpenInput { max_count: Some(1) }),
+            Err(ReconcileError::Busy)
+        ));
+        assert_open(&service, &id);
+    }
+
+    #[test]
+    fn overlapping_expected_payment_watch_is_rejected() {
+        let (_directory, service, id) = setup(100_000, false);
+        service
+            .store
+            .acquire_reconciliation_lease("other-run", 0, i64::MAX)
+            .expect("lease");
+        assert!(matches!(
+            service.watch_id_with(&id, 1, Duration::ZERO, |_| {}),
             Err(ReconcileError::Busy)
         ));
         assert_open(&service, &id);

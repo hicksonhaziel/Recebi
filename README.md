@@ -18,8 +18,8 @@ reconciles them against finalized Solana transactions. It contains:
   protection, immutable PTAX evidence/month closes, and a singleton
   reconciliation lease.
 - `recebi-mcp`: a stdio MCP server with `recebi_health`,
-  `recebi_create_request`, `recebi_check`, `recebi_reconcile_open`, and
-  `recebi_close_month`.
+  `recebi_create_request`, `recebi_check`, `recebi_watch_payment`,
+  `recebi_reconcile_open`, and `recebi_close_month`.
 
 `recebi_create_request` accepts only a receivable ID, positive decimal amount,
 and public wallet-display label. It derives recipient, mint, decimals, and
@@ -83,7 +83,12 @@ ZeroClaw configuration. Attach the `recebi` bundle only to the intended agent.
 
 `recebi_health` returns configuration and local-directory availability.
 Creation does not contact an RPC endpoint. `recebi_check` reconciles one ID;
-`recebi_reconcile_open` checks a configured bounded batch.
+`recebi_watch_payment` performs stock-host-safe two-poll windows while that
+payment is expected. The focused skill starts at window one, advances only on
+`continue`, and stops after at most window four or immediately on a terminal
+result.
+`recebi_reconcile_open` checks a configured bounded batch and is available for
+manual or explicitly enabled low-frequency recovery scans.
 `recebi_close_month` accepts only `YYYY-MM`, performs bounded official PTAX
 reads for verified records, and writes deterministic local evidence artifacts.
 None of these tools has a financial write capability.

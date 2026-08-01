@@ -1,7 +1,9 @@
 # Reconcile open receivables
 
-Purpose: run one bounded, memory-free reconciliation pass without allowing the
-model to decide settlement truth.
+Purpose: provide an optional low-frequency recovery scan without allowing the
+model to decide settlement truth. The default live-payment path is the bounded
+on-demand `recebi_watch_payment` tool, so this schedule should remain disabled
+unless an operator explicitly wants background recovery scans.
 
 ## Agent prompt
 
@@ -19,10 +21,11 @@ receivable was paid from an error.
 
 ## ZeroClaw schedule
 
-The operator installs the prompt as an explicit-agent cron job and restricts
-the invocation to the single reconciliation tool. Five minutes is the
-responsiveness target; the MCP batch remains capped at ten records and uses a
-SQLite singleton lease, so this does not turn into an unbounded RPC loop:
+If explicitly required, the operator installs the prompt as an explicit-agent
+cron job and restricts the invocation to the single reconciliation tool. This
+is not the ten-second demo path and must not be enabled merely because an open
+receivable exists. The MCP batch remains capped at ten records and uses a
+SQLite singleton lease, so it cannot become an unbounded RPC loop:
 
 ```bash
 zeroclaw cron add '*/5 * * * *' \

@@ -5,14 +5,15 @@ usage() {
   printf '%s\n' \
     'Usage: scripts/install-reconcile-cron.sh JOB_ID TELEGRAM_CHAT_ID' \
     '' \
-    'Hardens an existing ZeroClaw Recebi agent cron job:' \
+    'Hardens an optional ZeroClaw Recebi recovery cron job:' \
     '  - five-minute Africa/Lagos schedule;' \
     '  - memory disabled and one allowed Recebi tool;' \
     '  - Telegram announce delivery with fail-closed delivery errors;' \
     '  - bounded alert/quiet prompt; and' \
     '  - a mode-0600 SQLite backup before the update.' \
     '' \
-    'Create the agent job first with `zeroclaw cron add --prompt`, then pass' \
+    'This is not the default live-payment path. Prefer `Watch <ID>` in chat.' \
+    'Create the fallback job first with `zeroclaw cron add --prompt`, then pass' \
     'its printed ID and the authorized Telegram peer/chat ID.' \
     '' \
     'Optional environment overrides:' \

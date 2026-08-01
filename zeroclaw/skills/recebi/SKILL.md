@@ -26,6 +26,35 @@ Use `recebi__recebi_check` when the operator asks whether one known receivable
 was paid. Pass exactly `receivable_id`; never pass a signature, reference,
 wallet, mint, cluster, endpoint, or expected amount.
 
+Use `recebi__recebi_watch_payment` only when the operator explicitly says they
+are expecting payment now or asks to watch one known receivable. Pass exactly
+`receivable_id` and `window`. Start with `window: 1`. Each stock-host-safe
+window checks immediately and once more after ten seconds. When and only when
+the outcome is `continue`, call the same tool again with the same receivable ID
+and the next window number. Never exceed window 4. Do not narrate intermediate
+windows. Stop immediately on any outcome other than `continue` and return one
+final answer to the operator.
+
+Do not start a watch before returning a newly created payment URL: first return
+the URL, then let the operator say `Watch <receivable_id>`.
+
+The watch outcome is also literal:
+
+- `terminal`: interpret only the nested `last_observation` using the states
+  below;
+- `continue`: silently invoke the next numbered window, unless window 4 was
+  already used—in that impossible case, fail closed and stop;
+- `pending_timeout`: the watch window ended after a complete final check and
+  no accepted settlement was found; say it remains open and may be watched
+  again when payment is expected;
+- `incomplete_timeout`: RPC or transaction evidence was incomplete on the
+  final check; say the current chain status is unknown and never call it paid.
+
+Each tool window's ten-second loop is deterministic. The model may bridge at
+most four bounded windows only while this payment is expected. Never repeat a
+window number, invent window 5, change the interval, or start an unbounded
+retry.
+
 Interpret deterministic tool states literally:
 
 - `pending`: no accepted finalized settlement was found; say it remains open.
@@ -76,8 +105,10 @@ For Portuguese operator messages, reply in concise Brazilian Portuguese:
 Use concise English equivalents when the operator writes in English. Never
 translate identifiers, signatures, hashes, reasons, or action names.
 
-Use `recebi__recebi_reconcile_open` only for an operator-requested or scheduled
-bounded scan. Pass no arguments or a `max_count` no greater than 10. Report the
+Use `recebi__recebi_reconcile_open` only for an operator-requested bounded scan
+or an explicitly enabled low-frequency fallback schedule. It is not the
+default live-payment path; use the on-demand watch while payment is expected.
+Pass no arguments or a `max_count` no greater than 10. Report the
 checked, payment_verified, pending, needs_review, and incomplete counts plus at
 most the returned anomaly and incomplete IDs. An incomplete record means its
 status is unknown and must not be called paid. For a scheduled run, report a
