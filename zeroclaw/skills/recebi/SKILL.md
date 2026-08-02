@@ -15,8 +15,26 @@ Pass exactly `receivable_id`, `amount`, and `public_label`. Never add a memo,
 wallet address, mint, RPC URL, data path, private information, or extra field.
 Those values are either prohibited or controlled by trusted local config.
 
-On success, report the receivable ID, requested amount, reference, and Solana
-Pay URL compactly. State only that it is **open**—do not claim it was paid.
+On success, the result includes a private Telegram-compatible PNG rendered
+from the persisted canonical Solana Pay URL. This is a mandatory outbound
+transport protocol: when `attachment_marker` is not null, the final reply MUST
+end with that exact marker as its own final line. Copy it verbatim, without
+backticks, a code block, explanation, alteration, or omission. It is not a
+path to discuss with the operator. ZeroClaw removes the marker and uploads its
+PNG as a Telegram photo. A response that says a QR was rendered but does not
+end in the marker is incorrect. Report the receivable ID, requested amount,
+reference, and Solana Pay URL compactly before that final line. State only that
+it is **open**—do not claim it was paid.
+
+If the create result has `qr_error` or a null `attachment_marker`, call
+`recebi__recebi_render_qr` once with exactly the same `receivable_id`. If that
+retry also fails, report the URL and bounded rendering error; do not claim that
+a QR was sent.
+
+If the operator later asks to resend or display a QR for a known receivable,
+call `recebi__recebi_render_qr` with exactly `receivable_id`, then end the
+final reply with its exact `attachment_marker` line. Never pass a URL, path,
+wallet, mint, or image format.
 
 If the operator gives sensitive information for a label, ask for a non-sensitive
 public label instead. If amount or ID is missing, ask only for the missing

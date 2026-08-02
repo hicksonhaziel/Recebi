@@ -11,6 +11,8 @@ base64.workspace = true
 bs58.workspace = true
 clap.workspace = true
 getrandom.workspace = true
+image.workspace = true
+qrcode.workspace = true
 recebi-core = { path = "../../crates/recebi-core" }
 recebi-store = { path = "../../crates/recebi-store" }
 serde.workspace = true

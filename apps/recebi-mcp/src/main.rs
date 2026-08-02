@@ -3,6 +3,7 @@ mod config;
 mod health;
 mod mcp;
 mod ptax;
+mod qr;
 mod receivable;
 mod reconcile;
 mod rpc;

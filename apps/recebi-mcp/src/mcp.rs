@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::health::HealthService;
-use crate::receivable::{CreateRequestInput, ReceivableService};
+use crate::receivable::{CreateRequestInput, ReceivableService, RenderQrInput};
 use crate::{
     close_month::{CloseMonthInput, CloseMonthService, SnapshotMonthInput},
     ptax::HttpBcbPtax,
@@ -99,6 +99,7 @@ fn dispatch(
             &json!({"tools": [
                 health_tool_schema(),
                 create_request_tool_schema(),
+                render_qr_tool_schema(),
                 check_tool_schema(),
                 watch_payment_tool_schema(),
                 reconcile_open_tool_schema(),
@@ -134,6 +135,7 @@ fn call_tool(
         Some("recebi_create_request") => {
             call_create_request(receivables, id, params.get("arguments"))
         }
+        Some("recebi_render_qr") => call_render_qr(receivables, id, params.get("arguments")),
         Some("recebi_check") => call_check(reconciliation, id, params.get("arguments")),
         Some("recebi_watch_payment") => {
             call_watch_payment(reconciliation, id, params.get("arguments"))
@@ -309,6 +311,16 @@ fn call_create_request(
     }
 }
 
+fn call_render_qr(receivables: &ReceivableService, id: &Value, arguments: Option<&Value>) -> Value {
+    let Some(arguments) = arguments else {
+        return error_response(id, -32602, "invalid_render_qr_arguments");
+    };
+    let Ok(input) = serde_json::from_value::<RenderQrInput>(arguments.clone()) else {
+        return error_response(id, -32602, "invalid_render_qr_arguments");
+    };
+    tool_result(id, receivables.render_qr(input))
+}
+
 fn health_tool_schema() -> Value {
     json!({
         "name": "recebi_health",
@@ -329,6 +341,21 @@ fn create_request_tool_schema() -> Value {
                 "public_label": {"type": "string", "maxLength": 120, "description": "Public wallet-display label; do not include sensitive data."}
             },
             "required": ["receivable_id", "amount", "public_label"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn render_qr_tool_schema() -> Value {
+    json!({
+        "name": "recebi_render_qr",
+        "description": "Render the persisted canonical Solana Pay URL for one receivable as a private Telegram-compatible PNG. It never accepts or constructs payment terms, signs, or submits.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "receivable_id": {"type": "string", "maxLength": 64}
+            },
+            "required": ["receivable_id"],
             "additionalProperties": false
         }
     })
@@ -441,15 +468,22 @@ fn encode_response(response: &Value) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use serde_json::json;
 
     use super::{
         close_month_tool_schema, create_request_tool_schema, dispatch, encode_response,
-        health_tool_schema, snapshot_month_tool_schema, watch_payment_tool_schema,
+        health_tool_schema, render_qr_tool_schema, snapshot_month_tool_schema,
+        watch_payment_tool_schema,
     };
     use crate::{
-        close_month::CloseMonthService, config::AppConfig, health::HealthService,
-        ptax::HttpBcbPtax, receivable::ReceivableService, reconcile::ReconciliationService,
+        close_month::CloseMonthService,
+        config::AppConfig,
+        health::HealthService,
+        ptax::HttpBcbPtax,
+        receivable::{CreateRequestInput, ReceivableService},
+        reconcile::ReconciliationService,
         rpc::HttpSolanaRpc,
     };
 
@@ -505,6 +539,13 @@ max_open_reconcile = 10
         for forbidden_surface in ["wallet", "private_key", "sign", "submit", "refund"] {
             assert!(!schema_keys.contains(forbidden_surface));
         }
+        let qr_schema = render_qr_tool_schema();
+        assert_eq!(qr_schema["name"], "recebi_render_qr");
+        assert_eq!(
+            qr_schema["inputSchema"]["required"],
+            json!(["receivable_id"])
+        );
+        assert_eq!(qr_schema["inputSchema"]["additionalProperties"], false);
         let close_schema = close_month_tool_schema();
         assert_eq!(close_schema["name"], "recebi_close_month");
         assert_eq!(close_schema["inputSchema"]["required"], json!(["month"]));
@@ -587,6 +628,68 @@ max_open_reconcile = 10
             result["error"]["message"],
             "invalid_create_request_arguments"
         );
+    }
+
+    #[test]
+    fn render_qr_rejects_model_supplied_url_or_path() {
+        let (_directory, health, receivables, reconciliation, closing) = services();
+        let result = dispatch(
+            &health,
+            &receivables,
+            &reconciliation,
+            &closing,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "recebi_render_qr", "arguments": {
+                    "receivable_id": "ACME-412",
+                    "solana_pay_url": "solana:attacker",
+                    "output_path": "/tmp/attacker.png"
+                }}
+            }),
+        );
+        assert_eq!(result["error"]["message"], "invalid_render_qr_arguments");
+    }
+
+    #[test]
+    fn render_qr_uses_the_persisted_canonical_url_and_returns_attachment_marker() {
+        let (_directory, health, receivables, reconciliation, closing) = services();
+        let created = receivables
+            .create(CreateRequestInput {
+                receivable_id: "QR-001".to_owned(),
+                amount: "0.01".to_owned(),
+                public_label: "QR test".to_owned(),
+            })
+            .expect("create");
+        let created_json = serde_json::to_value(created).expect("create JSON");
+        assert!(
+            created_json["attachment_marker"]
+                .as_str()
+                .is_some_and(|marker| marker.starts_with("[IMAGE:") && marker.ends_with(']'))
+        );
+        let result = dispatch(
+            &health,
+            &receivables,
+            &reconciliation,
+            &closing,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "recebi_render_qr", "arguments": {
+                    "receivable_id": "QR-001"
+                }}
+            }),
+        );
+        let text = result["result"]["content"][0]["text"]
+            .as_str()
+            .expect("render result text");
+        let rendered: serde_json::Value = serde_json::from_str(text).expect("render JSON");
+        assert_eq!(rendered["receivable_id"], "QR-001");
+        assert_eq!(rendered["state"], "open");
+        assert!(
+            rendered["attachment_marker"]
+                .as_str()
+                .is_some_and(|marker| marker.starts_with("[IMAGE:") && marker.ends_with(']'))
+        );
+        assert!(Path::new(rendered["qr_image_path"].as_str().expect("path")).is_file());
     }
 
     #[test]
