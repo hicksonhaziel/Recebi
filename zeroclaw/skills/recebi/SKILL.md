@@ -46,6 +46,7 @@ marker:
 • Status: Awaiting payment
 • Reference: `...`
 • Solana Pay: <URL>
+• Official PTAX: Added during monthly close
 
 Hot monitoring is active for 3 minutes. The 5-minute reconciliation job then
 continues automatically.
@@ -72,6 +73,7 @@ print the raw `signature`; use only the trusted `explorer_url`:
 • Invoice: `INV-001`
 • Amount: `0.10 USDC`
 • Status: Exact payment recorded
+• Official PTAX: Pending monthly close
 • Signature: [View in Solana Explorer](EXPLORER_URL)
 ```
 
@@ -83,6 +85,7 @@ print the raw `signature`; use only the trusted `explorer_url`:
 • Reason: `wrong_amount`
 • Expected: `0.10 USDC`
 • Received: `0.01 USDC`
+• Official PTAX: Not available — invoice unpaid
 • Signature: [View in Solana Explorer](EXPLORER_URL)
 ```
 

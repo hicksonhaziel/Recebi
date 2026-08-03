@@ -100,6 +100,13 @@ pub struct StoredSettlementSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredTerminalNotification {
+    pub id: u64,
+    pub receivable_id: ReceivableId,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredMonthClose {
     pub month: String,
     pub revision: u32,
@@ -167,6 +174,23 @@ impl ReceivableStore {
                  variance_reason TEXT CHECK(variance_reason IN ('rounding_adjustment','commercial_discount','merchant_write_off')),
                  approval_run_id TEXT
              );
+             CREATE TABLE IF NOT EXISTS terminal_notifications (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 receivable_id TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK(status IN ('payment_verified','needs_review')),
+                 evidence_fingerprint TEXT NOT NULL UNIQUE,
+                 created_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE TRIGGER IF NOT EXISTS terminal_notifications_no_update BEFORE UPDATE ON terminal_notifications BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS terminal_notifications_no_delete BEFORE DELETE ON terminal_notifications BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TABLE IF NOT EXISTS terminal_notification_deliveries (
+                 notification_id INTEGER PRIMARY KEY NOT NULL,
+                 delivered_at_unix_ms INTEGER NOT NULL,
+                 delivery_receipt TEXT NOT NULL,
+                 FOREIGN KEY(notification_id) REFERENCES terminal_notifications(id)
+             );
+             CREATE TRIGGER IF NOT EXISTS terminal_notification_deliveries_no_update BEFORE UPDATE ON terminal_notification_deliveries BEGIN SELECT RAISE(ABORT, 'append_only'); END;
+             CREATE TRIGGER IF NOT EXISTS terminal_notification_deliveries_no_delete BEFORE DELETE ON terminal_notification_deliveries BEGIN SELECT RAISE(ABORT, 'append_only'); END;
              CREATE TABLE IF NOT EXISTS review_candidates (
                  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                  receivable_id TEXT NOT NULL,
@@ -488,6 +512,18 @@ impl ReceivableStore {
             )
             .as_bytes(),
         )?;
+        transaction
+            .execute(
+                "INSERT INTO terminal_notifications (
+                    receivable_id,status,evidence_fingerprint,created_at_unix_ms
+                 ) VALUES (?1,'payment_verified',?2,?3)",
+                params![
+                    receivable_id.as_str(),
+                    evidence.fingerprint,
+                    observed_at_unix_ms
+                ],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
         append_ledger_checkpoint(&transaction)?;
         transaction.commit().map_err(|_| StoreError::Unavailable)
     }
@@ -621,6 +657,18 @@ impl ReceivableStore {
             )
             .as_bytes(),
         )?;
+        transaction
+            .execute(
+                "INSERT INTO terminal_notifications (
+                    receivable_id,status,evidence_fingerprint,created_at_unix_ms
+                 ) VALUES (?1,'needs_review',?2,?3)",
+                params![
+                    receivable_id.as_str(),
+                    candidate_fingerprint,
+                    observed_at_unix_ms
+                ],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
         append_ledger_checkpoint(&transaction)?;
         transaction.commit().map_err(|_| StoreError::Unavailable)
     }
@@ -824,6 +872,131 @@ impl ReceivableStore {
             },
         )
         .transpose()
+    }
+
+    /// Returns terminal settlement/review notifications that have not yet
+    /// received a durable delivery receipt.
+    ///
+    /// # Errors
+    ///
+    /// Malformed identifiers or storage failures fail closed.
+    pub fn pending_terminal_notifications(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredTerminalNotification>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.verify_ledger_integrity()?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT n.id,n.receivable_id,n.status
+                 FROM terminal_notifications n
+                 LEFT JOIN terminal_notification_deliveries d
+                   ON d.notification_id=n.id
+                 WHERE d.notification_id IS NULL
+                 ORDER BY n.id LIMIT ?1",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        let rows = statement
+            .query_map(
+                [i64::try_from(limit).map_err(|_| StoreError::Unavailable)?],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|_| StoreError::Unavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::Unavailable)?;
+        rows.into_iter()
+            .map(|(id, receivable_id, status)| {
+                if status != "payment_verified" && status != "needs_review" {
+                    return Err(StoreError::Integrity);
+                }
+                Ok(StoredTerminalNotification {
+                    id: u64::try_from(id).map_err(|_| StoreError::Integrity)?,
+                    receivable_id: ReceivableId::new(receivable_id)
+                        .map_err(|_| StoreError::Integrity)?,
+                    status,
+                })
+            })
+            .collect()
+    }
+
+    /// Appends a durable receipt after the external notification transport
+    /// confirms delivery. Exact receipt retries are idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Unknown notifications, conflicting receipts, or storage failures fail
+    /// closed.
+    pub fn mark_terminal_notification_delivered(
+        &self,
+        notification_id: u64,
+        delivered_at_unix_ms: i64,
+        delivery_receipt: &str,
+    ) -> Result<(), StoreError> {
+        if delivery_receipt.is_empty() || delivery_receipt.len() > 128 {
+            return Err(StoreError::Integrity);
+        }
+        let connection = self.connection()?;
+        let id = i64::try_from(notification_id).map_err(|_| StoreError::Integrity)?;
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM terminal_notifications WHERE id=?1",
+                [id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?
+            .is_some();
+        if !exists {
+            return Err(StoreError::Integrity);
+        }
+        let existing = connection
+            .query_row(
+                "SELECT delivery_receipt FROM terminal_notification_deliveries
+                 WHERE notification_id=?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?;
+        if let Some(existing) = existing {
+            return if existing == delivery_receipt {
+                Ok(())
+            } else {
+                Err(StoreError::Integrity)
+            };
+        }
+        connection
+            .execute(
+                "INSERT INTO terminal_notification_deliveries (
+                    notification_id,delivered_at_unix_ms,delivery_receipt
+                 ) VALUES (?1,?2,?3)",
+                params![id, delivered_at_unix_ms, delivery_receipt],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(())
+    }
+
+    /// Returns immutable official PTAX evidence when it has been attached by
+    /// a monthly snapshot or final close.
+    ///
+    /// # Errors
+    ///
+    /// Malformed evidence or storage failures fail closed.
+    pub fn valuation(
+        &self,
+        receivable_id: &ReceivableId,
+    ) -> Result<Option<StoredValuation>, StoreError> {
+        self.verify_ledger_integrity()?;
+        find_valuation_in(&self.connection()?, receivable_id.as_str())
     }
 
     /// Returns the bounded candidate summary for a receivable in review.

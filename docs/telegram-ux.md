@@ -26,6 +26,7 @@ Never invent missing values.
 • Status: Awaiting payment
 • Reference: `...`
 • Solana Pay: <URL>
+• Official PTAX: Added during monthly close
 
 Hot monitoring is active for 3 minutes. The 5-minute reconciliation job then
 continues automatically.
@@ -41,6 +42,7 @@ The QR attachment marker remains the final line of the model reply.
 • Invoice: `INV-001`
 • Amount: `0.10 USDC`
 • Status: Exact payment recorded
+• Official PTAX: Pending monthly close
 • Signature: [View in Solana Explorer](EXPLORER_URL)
 ```
 
@@ -54,6 +56,7 @@ The QR attachment marker remains the final line of the model reply.
 • Reason: `wrong_amount`
 • Expected: `0.10 USDC`
 • Received: `0.01 USDC`
+• Official PTAX: Not available — invoice unpaid
 • Signature: [View in Solana Explorer](EXPLORER_URL)
 ```
 

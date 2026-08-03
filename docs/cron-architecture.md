@@ -12,6 +12,9 @@
 - No terminal records: the runner exits quietly.
 - Terminal record: the runner sends one structured Telegram alert with an
   Explorer link.
+- Terminal records stay in Recebi's durable delivery outbox until ZeroClaw's
+  Telegram sender succeeds and the runner appends a delivery receipt. Both hot
+  and background passes can retry an undelivered record.
 
 The watchdog stays installed, but the shell worker exists only for one no-op
 pass or one bounded hot window. An invoice leaves the hot set after three

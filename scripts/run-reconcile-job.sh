@@ -26,7 +26,6 @@ telegram_chat_id=$2
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 mcp_binary=${RECEBI_MCP_BINARY:-"$repo_dir/target/release/recebi-mcp"}
 recebi_config=${RECEBI_CONFIG:-"$HOME/.zeroclaw/recebi.toml"}
-channel_id=${ZEROCLAW_CHANNEL:-telegram}
 hot_passes=${RECEBI_HOT_PASSES:-36}
 hot_interval_ms=${RECEBI_HOT_INTERVAL_MS:-5000}
 if [[ -n ${ZEROCLAW_BIN:-} ]]; then
@@ -54,11 +53,6 @@ if [[ ! $telegram_chat_id =~ ^-?[0-9]+$ ]]; then
   printf '%s\n' 'Telegram chat ID must be numeric' >&2
   exit 2
 fi
-if [[ ! $channel_id =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
-  printf '%s\n' 'invalid ZeroClaw channel ID' >&2
-  exit 2
-fi
-
 if [[ -z $zeroclaw_bin || ! -x $zeroclaw_bin ]]; then
   printf '%s\n' 'missing required command: zeroclaw' >&2
   exit 2
@@ -77,7 +71,6 @@ done
   printf 'Recebi config is not readable: %s\n' "$recebi_config" >&2
   exit 2
 }
-
 if [[ $mode == hot ]]; then
   tool_name='recebi_hot_reconcile'
   arguments='{}'
@@ -90,12 +83,26 @@ fi
 
 send_message() {
   "$zeroclaw_bin" channel send "$1" \
-    --channel-id "$channel_id" \
+    --channel-id telegram \
     --recipient "$telegram_chat_id"
 }
 
+acknowledge_notification() {
+  local notification_id=$1 delivery_receipt=$2 request response
+  request=$(jq -cn \
+    --argjson notification_id "$notification_id" \
+    --arg delivery_receipt "$delivery_receipt" \
+    '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"recebi_acknowledge_notification",arguments:{notification_id:$notification_id,delivery_receipt:$delivery_receipt}}}')
+  response=$(printf '%s\n' "$request" | "$mcp_binary" --config "$recebi_config")
+  jq -e '.result.content[0].text and (.result.isError == false)' \
+    >/dev/null <<<"$response" || {
+    printf '%s\n' 'Recebi notification acknowledgement failed closed' >&2
+    return 3
+  }
+}
+
 run_pass() {
-  local request response record status message
+  local request response record status message notification_id delivery_receipt
   local -a terminal_records
 
   request=$(jq -cn \
@@ -119,6 +126,7 @@ run_pass() {
 
   mapfile -t terminal_records < <(jq -c '.terminal[]' <<<"$result")
   for record in "${terminal_records[@]}"; do
+    notification_id=$(jq -r '.notification_id' <<<"$record")
     status=$(jq -r '.status' <<<"$record")
     case $status in
       payment_verified)
@@ -127,6 +135,7 @@ run_pass() {
           "• Invoice: `" + .receivable_id + "`\n" +
           "• Amount: `" + (.received_amount // .expected_amount // "unknown") + " USDC`\n" +
           "• Status: Exact payment recorded\n" +
+          "• Official PTAX: Pending monthly close\n" +
           "• Signature: [View in Solana Explorer](" + .explorer_url + ")"
         ' <<<"$record")
         ;;
@@ -138,6 +147,7 @@ run_pass() {
           "• Reason: `" + (.reason // "verification_failed") + "`" +
           (if .expected_amount then "\n• Expected: `" + .expected_amount + " USDC`" else "" end) +
           (if .received_amount then "\n• Received: `" + .received_amount + " USDC`" else "" end) +
+          "\n• Official PTAX: Not available — invoice unpaid" +
           "\n• Signature: [View in Solana Explorer](" + .explorer_url + ")"
         ' <<<"$record")
         ;;
@@ -147,6 +157,8 @@ run_pass() {
         ;;
     esac
     send_message "$message"
+    delivery_receipt="telegram:${telegram_chat_id}:${notification_id}"
+    acknowledge_notification "$notification_id" "$delivery_receipt"
   done
 }
 

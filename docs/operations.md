@@ -37,6 +37,18 @@ Expected state:
 - hot job unavailable: the five-minute background job remains authoritative.
 - Telegram delivery failure: job delivery is fail-closed and the failed run is
   visible in ZeroClaw history.
+- The hot runner uses ZeroClaw's supported one-off Telegram sender and records
+  a durable Recebi delivery receipt only after that command succeeds. On
+  ZeroClaw 0.8.3 the sender resolves `[channels.telegram.default]`, so the live
+  bot alias must be named `default`.
+
+## PTAX evidence
+
+Official BCB PTAX evidence is not available on a newly created invoice. It is
+attached during a provisional snapshot or final close after a finalized
+payment, using the strict same-day quote policy. Invoice and payment messages
+therefore say `Added during monthly close` or `Pending monthly close`; they do
+not invent a quote before the close operation.
 
 ## Devnet proof
 

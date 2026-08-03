@@ -53,6 +53,19 @@ pub struct HotReconcileInput {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AcknowledgeNotificationInput {
+    pub notification_id: u64,
+    pub delivery_receipt: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AcknowledgeNotificationResult {
+    pub notification_id: u64,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolveReviewInput {
     pub receivable_id: String,
     pub candidate_fingerprint: String,
@@ -84,6 +97,27 @@ pub struct CheckResult {
     pub shortfall_amount: Option<String>,
     pub variance_eligible: bool,
     pub variance_reason: Option<VarianceReason>,
+    pub official_ptax: OfficialPtaxStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OfficialPtaxStatus {
+    pub status: &'static str,
+    pub operation_date: Option<String>,
+    pub quote_date: Option<String>,
+    pub purchase: Option<String>,
+    pub sale: Option<String>,
+    pub response_sha256: Option<String>,
+    pub brl_reference: Option<String>,
+    pub source_id: Option<String>,
+    pub policy_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TerminalNotification {
+    pub notification_id: u64,
+    #[serde(flatten)]
+    pub result: CheckResult,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -128,7 +162,7 @@ pub struct ReconcileOpenResult {
     pub incomplete: usize,
     pub anomaly_samples: Vec<String>,
     pub incomplete_samples: Vec<String>,
-    pub terminal: Vec<CheckResult>,
+    pub terminal: Vec<TerminalNotification>,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,7 +174,7 @@ pub struct HotReconcileResult {
     pub needs_review: usize,
     pub incomplete: usize,
     pub incomplete_samples: Vec<String>,
-    pub terminal: Vec<CheckResult>,
+    pub terminal: Vec<TerminalNotification>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -378,6 +412,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                     .map_err(|error| map_store(&error))?
                     .ok_or(ReconcileError::StorageUnavailable)?;
                 let signature = settlement.signature;
+                let official_ptax = self.official_ptax_status(id, true)?;
                 return Ok(CheckResult {
                     receivable_id: id.as_str().to_owned(),
                     status: CheckStatus::PaymentVerified,
@@ -394,6 +429,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                     shortfall_amount: None,
                     variance_eligible: false,
                     variance_reason: None,
+                    official_ptax,
                 });
             }
             ReceivableState::NeedsReview => {
@@ -426,6 +462,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                         .map(|evidence| evidence.shortfall_amount.format(stored.request.decimals)),
                     variance_eligible: candidate.underpayment.is_some(),
                     variance_reason: None,
+                    official_ptax: official_ptax_unavailable(),
                 });
             }
             ReceivableState::Cancelled => {
@@ -441,6 +478,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                     shortfall_amount: None,
                     variance_eligible: false,
                     variance_reason: None,
+                    official_ptax: official_ptax_unavailable(),
                 });
             }
             ReceivableState::SettledWithVariance => {
@@ -475,6 +513,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                     ),
                     variance_eligible: false,
                     variance_reason: settlement.variance_reason,
+                    official_ptax: self.official_ptax_status(id, true)?,
                 });
             }
             ReceivableState::Open => {}
@@ -572,6 +611,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                         shortfall_amount: None,
                         variance_eligible: false,
                         variance_reason: None,
+                        official_ptax: official_ptax_pending(),
                     });
                 }
                 Ok(SettlementAssessment::Underpayment(evidence)) => {
@@ -637,6 +677,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                 .map(|evidence| evidence.shortfall_amount.format(stored.request.decimals)),
             variance_eligible: underpayment.is_some(),
             variance_reason: None,
+            official_ptax: official_ptax_unavailable(),
         })
     }
 
@@ -789,6 +830,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
             terminal: vec![],
         };
         if open.is_empty() {
+            result.terminal = self.pending_terminal_notifications()?;
             return Ok(result);
         }
         let expected_genesis = self.config.recebi.genesis_hash.clone();
@@ -821,18 +863,12 @@ impl<R: SolanaRpc> ReconciliationService<R> {
             match checked.status {
                 CheckStatus::PaymentVerified => {
                     result.payment_verified += 1;
-                    if result.terminal.len() < MAX_ANOMALY_SAMPLES {
-                        result.terminal.push(checked);
-                    }
                 }
                 CheckStatus::Pending => result.pending += 1,
                 CheckStatus::NeedsReview => {
                     result.needs_review += 1;
                     if result.anomaly_samples.len() < MAX_ANOMALY_SAMPLES {
                         result.anomaly_samples.push(checked.receivable_id.clone());
-                    }
-                    if result.terminal.len() < MAX_ANOMALY_SAMPLES {
-                        result.terminal.push(checked);
                     }
                 }
                 CheckStatus::CancelledUnpaid => return Err(ReconcileError::StorageUnavailable),
@@ -841,6 +877,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                 }
             }
         }
+        result.terminal = self.pending_terminal_notifications()?;
         Ok(result)
     }
 
@@ -868,6 +905,63 @@ impl<R: SolanaRpc> ReconciliationService<R> {
         }
     }
 
+    pub fn acknowledge_notification(
+        &self,
+        input: &AcknowledgeNotificationInput,
+    ) -> Result<AcknowledgeNotificationResult, ReconcileError> {
+        if input.delivery_receipt.is_empty()
+            || input.delivery_receipt.len() > 128
+            || !input
+                .delivery_receipt
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
+        {
+            return Err(ReconcileError::InvalidInput);
+        }
+        self.store
+            .mark_terminal_notification_delivered(
+                input.notification_id,
+                now_unix_ms()?,
+                &input.delivery_receipt,
+            )
+            .map_err(|error| map_store(&error))?;
+        Ok(AcknowledgeNotificationResult {
+            notification_id: input.notification_id,
+            status: "delivered",
+        })
+    }
+
+    fn official_ptax_status(
+        &self,
+        id: &ReceivableId,
+        settled: bool,
+    ) -> Result<OfficialPtaxStatus, ReconcileError> {
+        let valuation = self
+            .store
+            .valuation(id)
+            .map_err(|error| map_store(&error))?;
+        Ok(valuation.map_or_else(
+            || {
+                if settled {
+                    official_ptax_pending()
+                } else {
+                    official_ptax_unavailable()
+                }
+            },
+            |valuation| OfficialPtaxStatus {
+                status: "bcb_verified",
+                operation_date: Some(valuation.evidence.operation_date.as_str().to_owned()),
+                quote_date: Some(valuation.evidence.quote_date.as_str().to_owned()),
+                purchase: Some(valuation.evidence.purchase),
+                sale: Some(valuation.evidence.sale),
+                response_sha256: Some(valuation.evidence.response_sha256),
+                brl_reference: Some(format_brl_cents(valuation.brl_reference_cents)),
+                source_id: Some(valuation.evidence.source_id),
+                policy_version: Some(valuation.evidence.policy_version),
+            },
+        ))
+    }
+
     fn hot_reconcile_acquired(&self, now: i64) -> Result<HotReconcileResult, ReconcileError> {
         let cutoff = now.saturating_sub(
             i64::try_from(HOT_WINDOW.as_millis())
@@ -892,13 +986,9 @@ impl<R: SolanaRpc> ReconciliationService<R> {
             match self.check_id(&receivable.request.receivable_id) {
                 Ok(checked) => match checked.status {
                     CheckStatus::Pending => result.pending += 1,
-                    CheckStatus::PaymentVerified => {
-                        result.payment_verified += 1;
-                        result.terminal.push(checked);
-                    }
+                    CheckStatus::PaymentVerified => result.payment_verified += 1,
                     CheckStatus::NeedsReview => {
                         result.needs_review += 1;
-                        result.terminal.push(checked);
                     }
                     CheckStatus::CancelledUnpaid | CheckStatus::SettledWithVariance => {
                         return Err(ReconcileError::StorageUnavailable);
@@ -915,7 +1005,31 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                 Err(error) => return Err(error),
             }
         }
+        result.terminal = self.pending_terminal_notifications()?;
         Ok(result)
+    }
+
+    fn pending_terminal_notifications(&self) -> Result<Vec<TerminalNotification>, ReconcileError> {
+        self.store
+            .pending_terminal_notifications(MAX_ANOMALY_SAMPLES)
+            .map_err(|error| map_store(&error))?
+            .into_iter()
+            .map(|notification| {
+                let result = self.check_id(&notification.receivable_id)?;
+                let expected_status = match result.status {
+                    CheckStatus::PaymentVerified => "payment_verified",
+                    CheckStatus::NeedsReview => "needs_review",
+                    _ => return Err(ReconcileError::StorageUnavailable),
+                };
+                if expected_status != notification.status {
+                    return Err(ReconcileError::StorageUnavailable);
+                }
+                Ok(TerminalNotification {
+                    notification_id: notification.id,
+                    result,
+                })
+            })
+            .collect()
     }
 }
 
@@ -942,7 +1056,40 @@ fn pending_result(receivable_id: &ReceivableId) -> CheckResult {
         shortfall_amount: None,
         variance_eligible: false,
         variance_reason: None,
+        official_ptax: official_ptax_unavailable(),
     }
+}
+
+fn official_ptax_pending() -> OfficialPtaxStatus {
+    OfficialPtaxStatus {
+        status: "pending_monthly_close",
+        operation_date: None,
+        quote_date: None,
+        purchase: None,
+        sale: None,
+        response_sha256: None,
+        brl_reference: None,
+        source_id: None,
+        policy_version: None,
+    }
+}
+
+fn official_ptax_unavailable() -> OfficialPtaxStatus {
+    OfficialPtaxStatus {
+        status: "not_available_unpaid",
+        operation_date: None,
+        quote_date: None,
+        purchase: None,
+        sale: None,
+        response_sha256: None,
+        brl_reference: None,
+        source_id: None,
+        policy_version: None,
+    }
+}
+
+fn format_brl_cents(cents: u64) -> String {
+    format!("{}.{:02}", cents / 100, cents % 100)
 }
 
 fn explorer_url(cluster: Cluster, signature: &str) -> String {
@@ -1667,8 +1814,11 @@ max_open_reconcile = 10
         assert_eq!(result.needs_review, 0);
         assert_eq!(result.incomplete, 0);
         assert_eq!(result.terminal.len(), 1);
-        assert_eq!(result.terminal[0].receivable_id, id.as_str());
-        assert_eq!(result.terminal[0].status, CheckStatus::PaymentVerified);
+        assert_eq!(result.terminal[0].result.receivable_id, id.as_str());
+        assert_eq!(
+            result.terminal[0].result.status,
+            CheckStatus::PaymentVerified
+        );
     }
 
     #[test]

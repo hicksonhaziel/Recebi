@@ -37,6 +37,7 @@ pub struct CreateRequestResult {
     attachment_marker: Option<String>,
     qr_error: Option<&'static str>,
     custody: &'static str,
+    official_ptax: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +199,7 @@ fn result_from(
         attachment_marker,
         qr_error,
         custody: "none",
+        official_ptax: "added_during_monthly_close",
     }
 }
 

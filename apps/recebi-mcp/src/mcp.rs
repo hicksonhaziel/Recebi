@@ -10,8 +10,8 @@ use crate::{
     close_month::{CloseMonthInput, CloseMonthService, SnapshotMonthInput},
     ptax::HttpBcbPtax,
     reconcile::{
-        CheckInput, HotReconcileInput, ReconcileOpenInput, ReconciliationService,
-        ResolveReviewInput, WatchPaymentInput,
+        AcknowledgeNotificationInput, CheckInput, HotReconcileInput, ReconcileOpenInput,
+        ReconciliationService, ResolveReviewInput, WatchPaymentInput,
     },
     rpc::HttpSolanaRpc,
 };
@@ -144,6 +144,9 @@ fn call_tool(
         Some("recebi_hot_reconcile") => {
             call_hot_reconcile(reconciliation, id, params.get("arguments"))
         }
+        Some("recebi_acknowledge_notification") => {
+            call_acknowledge_notification(reconciliation, id, params.get("arguments"))
+        }
         Some("recebi_reconcile_open") => {
             call_reconcile_open(reconciliation, id, params.get("arguments"))
         }
@@ -248,6 +251,21 @@ fn call_hot_reconcile(
         return error_response(id, -32602, "invalid_hot_reconcile_arguments");
     };
     tool_result(id, reconciliation.hot_reconcile(input))
+}
+
+fn call_acknowledge_notification(
+    reconciliation: &ReconciliationService<HttpSolanaRpc>,
+    id: &Value,
+    arguments: Option<&Value>,
+) -> Value {
+    let Some(arguments) = arguments else {
+        return error_response(id, -32602, "invalid_acknowledgement_arguments");
+    };
+    let Ok(input) = serde_json::from_value::<AcknowledgeNotificationInput>(arguments.clone())
+    else {
+        return error_response(id, -32602, "invalid_acknowledgement_arguments");
+    };
+    tool_result(id, reconciliation.acknowledge_notification(&input))
 }
 
 fn tool_result<T: serde::Serialize, E: std::fmt::Display>(
