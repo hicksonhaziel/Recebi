@@ -18,14 +18,15 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, Cluster},
     rpc::{HttpSolanaRpc, RpcError, SolanaRpc},
 };
 
 const LEASE_DURATION_MS: i64 = 60_000;
-const WATCH_INTERVAL: Duration = Duration::from_secs(10);
+const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 const WATCH_POLLS_PER_WINDOW: u8 = 2;
 const WATCH_MAX_WINDOWS: u8 = 4;
+const HOT_WINDOW: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +46,10 @@ pub struct WatchPaymentInput {
 pub struct ReconcileOpenInput {
     pub max_count: Option<u16>,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HotReconcileInput {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,6 +76,7 @@ pub struct CheckResult {
     pub receivable_id: String,
     pub status: CheckStatus,
     pub signature: Option<String>,
+    pub explorer_url: Option<String>,
     pub reason: Option<String>,
     pub candidate_fingerprint: Option<String>,
     pub expected_amount: Option<String>,
@@ -122,6 +128,19 @@ pub struct ReconcileOpenResult {
     pub incomplete: usize,
     pub anomaly_samples: Vec<String>,
     pub incomplete_samples: Vec<String>,
+    pub terminal: Vec<CheckResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HotReconcileResult {
+    pub window_seconds: u64,
+    pub checked: usize,
+    pub payment_verified: usize,
+    pub pending: usize,
+    pub needs_review: usize,
+    pub incomplete: usize,
+    pub incomplete_samples: Vec<String>,
+    pub terminal: Vec<CheckResult>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -353,19 +372,25 @@ impl<R: SolanaRpc> ReconciliationService<R> {
             .ok_or(ReconcileError::NotFound)?;
         match stored.state {
             ReceivableState::PaymentVerified => {
-                let signature = self
+                let settlement = self
                     .store
-                    .settlement_signature(id)
+                    .settlement_summary(id)
                     .map_err(|error| map_store(&error))?
                     .ok_or(ReconcileError::StorageUnavailable)?;
+                let signature = settlement.signature;
                 return Ok(CheckResult {
                     receivable_id: id.as_str().to_owned(),
                     status: CheckStatus::PaymentVerified,
+                    explorer_url: Some(explorer_url(self.config.recebi.cluster, &signature)),
                     signature: Some(signature),
                     reason: None,
                     candidate_fingerprint: None,
-                    expected_amount: None,
-                    received_amount: None,
+                    expected_amount: Some(
+                        settlement.expected_amount.format(stored.request.decimals),
+                    ),
+                    received_amount: Some(
+                        settlement.received_amount.format(stored.request.decimals),
+                    ),
                     shortfall_amount: None,
                     variance_eligible: false,
                     variance_reason: None,
@@ -380,6 +405,10 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                 return Ok(CheckResult {
                     receivable_id: id.as_str().to_owned(),
                     status: CheckStatus::NeedsReview,
+                    explorer_url: Some(explorer_url(
+                        self.config.recebi.cluster,
+                        &candidate.signature,
+                    )),
                     signature: Some(candidate.signature),
                     reason: Some(candidate.verdict),
                     candidate_fingerprint: Some(candidate.candidate_fingerprint),
@@ -404,6 +433,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                     receivable_id: id.as_str().to_owned(),
                     status: CheckStatus::CancelledUnpaid,
                     signature: None,
+                    explorer_url: None,
                     reason: Some("cancelled_unpaid".to_owned()),
                     candidate_fingerprint: None,
                     expected_amount: None,
@@ -427,6 +457,10 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                 return Ok(CheckResult {
                     receivable_id: id.as_str().to_owned(),
                     status: CheckStatus::SettledWithVariance,
+                    explorer_url: Some(explorer_url(
+                        self.config.recebi.cluster,
+                        &settlement.signature,
+                    )),
                     signature: Some(settlement.signature),
                     reason: Some("operator_accepted_underpayment".to_owned()),
                     candidate_fingerprint: None,
@@ -526,11 +560,15 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                     return Ok(CheckResult {
                         receivable_id: expected.receivable_id.as_str().to_owned(),
                         status: CheckStatus::PaymentVerified,
+                        explorer_url: Some(explorer_url(
+                            self.config.recebi.cluster,
+                            &evidence.signature,
+                        )),
                         signature: Some(evidence.signature),
                         reason: None,
                         candidate_fingerprint: None,
-                        expected_amount: None,
-                        received_amount: None,
+                        expected_amount: Some(expected.amount.format(expected.token_decimals)),
+                        received_amount: Some(expected.amount.format(expected.token_decimals)),
                         shortfall_amount: None,
                         variance_eligible: false,
                         variance_reason: None,
@@ -584,6 +622,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
         Ok(CheckResult {
             receivable_id: stored.request.receivable_id.as_str().to_owned(),
             status: CheckStatus::NeedsReview,
+            explorer_url: Some(explorer_url(self.config.recebi.cluster, &signature)),
             signature: Some(signature),
             reason: Some(verdict.to_owned()),
             candidate_fingerprint: Some(candidate_fingerprint),
@@ -747,6 +786,7 @@ impl<R: SolanaRpc> ReconciliationService<R> {
             incomplete: 0,
             anomaly_samples: vec![],
             incomplete_samples: vec![],
+            terminal: vec![],
         };
         if open.is_empty() {
             return Ok(result);
@@ -779,18 +819,100 @@ impl<R: SolanaRpc> ReconciliationService<R> {
                 Err(error) => return Err(error),
             };
             match checked.status {
-                CheckStatus::PaymentVerified => result.payment_verified += 1,
+                CheckStatus::PaymentVerified => {
+                    result.payment_verified += 1;
+                    if result.terminal.len() < MAX_ANOMALY_SAMPLES {
+                        result.terminal.push(checked);
+                    }
+                }
                 CheckStatus::Pending => result.pending += 1,
                 CheckStatus::NeedsReview => {
                     result.needs_review += 1;
                     if result.anomaly_samples.len() < MAX_ANOMALY_SAMPLES {
                         result.anomaly_samples.push(checked.receivable_id.clone());
                     }
+                    if result.terminal.len() < MAX_ANOMALY_SAMPLES {
+                        result.terminal.push(checked);
+                    }
                 }
                 CheckStatus::CancelledUnpaid => return Err(ReconcileError::StorageUnavailable),
                 CheckStatus::SettledWithVariance => {
                     return Err(ReconcileError::StorageUnavailable);
                 }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Reconcile only invoices created during the short hot-monitoring window.
+    /// The permanent five-minute pass remains responsible for older invoices.
+    pub fn hot_reconcile(
+        &self,
+        _input: HotReconcileInput,
+    ) -> Result<HotReconcileResult, ReconcileError> {
+        let mut owner_bytes = [0_u8; 16];
+        fill(&mut owner_bytes).map_err(|_| ReconcileError::StorageUnavailable)?;
+        let owner = bs58::encode(owner_bytes).into_string();
+        let now = now_unix_ms()?;
+        self.store
+            .acquire_reconciliation_lease(&owner, now, now + LEASE_DURATION_MS)
+            .map_err(|error| map_store(&error))?;
+        let result = self.hot_reconcile_acquired(now);
+        let released = self
+            .store
+            .release_reconciliation_lease(&owner)
+            .map_err(|error| map_store(&error));
+        match (result, released) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+
+    fn hot_reconcile_acquired(&self, now: i64) -> Result<HotReconcileResult, ReconcileError> {
+        let cutoff = now.saturating_sub(
+            i64::try_from(HOT_WINDOW.as_millis())
+                .map_err(|_| ReconcileError::StorageUnavailable)?,
+        );
+        let open = self
+            .store
+            .list_open_since(cutoff, MAX_RECONCILE_RECEIVABLES)
+            .map_err(|error| map_store(&error))?;
+        let mut result = HotReconcileResult {
+            window_seconds: HOT_WINDOW.as_secs(),
+            checked: 0,
+            payment_verified: 0,
+            pending: 0,
+            needs_review: 0,
+            incomplete: 0,
+            incomplete_samples: Vec::new(),
+            terminal: Vec::new(),
+        };
+        for receivable in open {
+            result.checked += 1;
+            match self.check_id(&receivable.request.receivable_id) {
+                Ok(checked) => match checked.status {
+                    CheckStatus::Pending => result.pending += 1,
+                    CheckStatus::PaymentVerified => {
+                        result.payment_verified += 1;
+                        result.terminal.push(checked);
+                    }
+                    CheckStatus::NeedsReview => {
+                        result.needs_review += 1;
+                        result.terminal.push(checked);
+                    }
+                    CheckStatus::CancelledUnpaid | CheckStatus::SettledWithVariance => {
+                        return Err(ReconcileError::StorageUnavailable);
+                    }
+                },
+                Err(ReconcileError::RpcIncomplete | ReconcileError::MalformedEvidence) => {
+                    result.incomplete += 1;
+                    if result.incomplete_samples.len() < MAX_ANOMALY_SAMPLES {
+                        result
+                            .incomplete_samples
+                            .push(receivable.request.receivable_id.as_str().to_owned());
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(result)
@@ -812,6 +934,7 @@ fn pending_result(receivable_id: &ReceivableId) -> CheckResult {
         receivable_id: receivable_id.as_str().to_owned(),
         status: CheckStatus::Pending,
         signature: None,
+        explorer_url: None,
         reason: None,
         candidate_fingerprint: None,
         expected_amount: None,
@@ -819,6 +942,15 @@ fn pending_result(receivable_id: &ReceivableId) -> CheckResult {
         shortfall_amount: None,
         variance_eligible: false,
         variance_reason: None,
+    }
+}
+
+fn explorer_url(cluster: Cluster, signature: &str) -> String {
+    match cluster {
+        Cluster::MainnetBeta => format!("https://explorer.solana.com/tx/{signature}"),
+        Cluster::Devnet => {
+            format!("https://explorer.solana.com/tx/{signature}?cluster=devnet")
+        }
     }
 }
 
@@ -980,6 +1112,22 @@ mod tests {
         ReconciliationService<MockRpc>,
         ReceivableId,
     ) {
+        setup_at(
+            amount_in_transaction,
+            include_second_correct,
+            now_unix_ms().expect("test timestamp"),
+        )
+    }
+
+    fn setup_at(
+        amount_in_transaction: u64,
+        include_second_correct: bool,
+        created_at_unix_ms: i64,
+    ) -> (
+        tempfile::TempDir,
+        ReconciliationService<MockRpc>,
+        ReceivableId,
+    ) {
         let directory = tempfile::tempdir().expect("directory");
         let config_path = directory.path().join("recebi.toml");
         let merchant = key("CmQXip6WcPrzbx1waawoPMerj5A1jvtqZjHBxv6C4uit");
@@ -1019,7 +1167,7 @@ max_open_reconcile = 10
                     public_label: BoundedText::<MAX_PUBLIC_LABEL_BYTES>::new("Live test")
                         .expect("label"),
                 },
-                1,
+                created_at_unix_ms,
             )
             .expect("create");
         let first = raw_transaction(&merchant, &mint, &reference, amount_in_transaction, 7);
@@ -1134,6 +1282,15 @@ max_open_reconcile = 10
             })
             .expect("check");
         assert_eq!(first.status, CheckStatus::PaymentVerified);
+        assert_eq!(first.expected_amount.as_deref(), Some("0.1"));
+        assert_eq!(first.received_amount.as_deref(), Some("0.1"));
+        assert!(
+            first
+                .explorer_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://explorer.solana.com/tx/")
+                    && url.ends_with("?cluster=devnet"))
+        );
         let repeated = service
             .check(CheckInput {
                 receivable_id: id.as_str().to_owned(),
@@ -1494,6 +1651,37 @@ max_open_reconcile = 10
         assert_eq!(incomplete.incomplete, 1);
         assert_eq!(incomplete.incomplete_samples, vec![id.as_str().to_owned()]);
         assert_eq!(incomplete.payment_verified, 0);
+        assert_open(&service, &id);
+    }
+
+    #[test]
+    fn hot_reconcile_checks_only_the_recent_window_and_returns_terminal_evidence() {
+        let (_directory, service, id) = setup(100_000, false);
+        let result = service
+            .hot_reconcile(HotReconcileInput {})
+            .expect("hot reconciliation");
+        assert_eq!(result.window_seconds, 180);
+        assert_eq!(result.checked, 1);
+        assert_eq!(result.payment_verified, 1);
+        assert_eq!(result.pending, 0);
+        assert_eq!(result.needs_review, 0);
+        assert_eq!(result.incomplete, 0);
+        assert_eq!(result.terminal.len(), 1);
+        assert_eq!(result.terminal[0].receivable_id, id.as_str());
+        assert_eq!(result.terminal[0].status, CheckStatus::PaymentVerified);
+    }
+
+    #[test]
+    fn hot_reconcile_leaves_expired_invoices_for_the_background_pass() {
+        let old = now_unix_ms()
+            .expect("test timestamp")
+            .saturating_sub(181_000);
+        let (_directory, service, id) = setup_at(100_000, false, old);
+        let result = service
+            .hot_reconcile(HotReconcileInput {})
+            .expect("hot reconciliation");
+        assert_eq!(result.checked, 0);
+        assert!(result.terminal.is_empty());
         assert_open(&service, &id);
     }
 

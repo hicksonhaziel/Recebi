@@ -367,6 +367,41 @@ impl ReceivableStore {
             .collect()
     }
 
+    /// Returns open receivables created at or after the supplied timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted storage or integrity error.
+    pub fn list_open_since(
+        &self,
+        created_at_or_after_unix_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<StoredReceivable>, StoreError> {
+        self.verify_ledger_integrity()?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT receivable_id FROM receivables
+                 WHERE state = 'open' AND created_at_unix_ms >= ?1
+                 ORDER BY created_at_unix_ms, receivable_id LIMIT ?2",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        let ids = statement
+            .query_map(
+                params![
+                    created_at_or_after_unix_ms,
+                    i64::try_from(limit).map_err(|_| StoreError::Unavailable)?
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| StoreError::Unavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::Unavailable)?;
+        ids.into_iter()
+            .map(|id| find_in(&connection, &id)?.ok_or(StoreError::Integrity))
+            .collect()
+    }
+
     /// Atomically records exact settlement evidence and consumes both the
     /// signature and reference.
     ///

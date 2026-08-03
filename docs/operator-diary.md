@@ -172,3 +172,25 @@ are labelled honestly; they are not represented as client or mainnet usage.
   locked release build, SOP validation, diff check, and live health. Deployed
   release SHA-256:
   `9aba8bf10c7956044445ff9dbe04753ab1ee300122ace0edf61945e3e49f8fe9`.
+
+## 2026-08-03 — Phase 7 automatic hot reconciliation
+
+- Environment: self-operated Solana devnet; locally built Recebi; ZeroClaw
+  0.8.3; Telegram. This is builder-operated proof, not client or mainnet
+  activity.
+- Invoice `PHASE7-HOT-001` expected `0.10` USDC with reference
+  `8qN7goL5WgmLojaAhXmRGeg2cjHscnLy7Axdndh4VEfe`.
+- Isolated payer `F61VksbdSX4LZsh2DrtrX6WtSbjfuiHieMMdMErh6L6b` sent the exact
+  finalized devnet payment. Signature is retained in the ledger and exposed
+  to operators only through the trusted Explorer URL:
+  `https://explorer.solana.com/tx/4NCcDNhFSHnBdfhY6ZKLhjcZ595KgbiDrKYp673B6keKNTEXsppxH5Q6qDL78y2D6sEm9tuoXcCc2LU9sVkdMwrR?cluster=devnet`.
+- Recebi created the invoice at `2026-08-03 00:58:45 UTC` and the automatic
+  hot worker recorded `payment_verified` at `2026-08-03 00:59:30 UTC`.
+  SQLite contains one exact settlement and the durable state is
+  `payment_verified`; no signing key was used by Recebi.
+- The hot scheduler now uses a lightweight watchdog. With no recent invoice,
+  its worker exits after one pass; with a recent invoice, it checks at
+  five-second deadlines for at most three minutes. The permanent background
+  job remains every five minutes and reconciles all older open invoices.
+- The isolated payer balance after the proof is `8.282` devnet USDC and
+  `0.19988364` devnet SOL. No balance or private key is exposed in Telegram.

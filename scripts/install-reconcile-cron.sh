@@ -5,15 +5,15 @@ usage() {
   printf '%s\n' \
     'Usage: scripts/install-reconcile-cron.sh JOB_ID TELEGRAM_CHAT_ID' \
     '' \
-    'Hardens an optional ZeroClaw Recebi recovery cron job:' \
+    'Hardens the permanent ZeroClaw Recebi background reconciliation job:' \
     '  - five-minute Africa/Lagos schedule;' \
     '  - memory disabled and one allowed Recebi tool;' \
     '  - Telegram announce delivery with fail-closed delivery errors;' \
     '  - bounded alert/quiet prompt; and' \
     '  - a mode-0600 SQLite backup before the update.' \
     '' \
-    'This is not the default live-payment path. Prefer `Watch <ID>` in chat.' \
-    'Create the fallback job first with `zeroclaw cron add --prompt`, then pass' \
+    'This is the five-minute fallback after the short hot window.' \
+    'Create the job first with `zeroclaw cron add --prompt`, then pass' \
     'its printed ID and the authorized Telegram peer/chat ID.' \
     '' \
     'Optional environment overrides:' \
@@ -41,7 +41,7 @@ expression=${RECEBI_CRON_EXPRESSION:-'*/5 * * * *'}
 agent_alias=${RECEBI_CRON_AGENT:-hickson}
 restart=${RECEBI_CRON_RESTART:-true}
 tool_name='recebi__recebi_reconcile_open'
-prompt='Run exactly one Recebi reconciliation pass. Call only recebi__recebi_reconcile_open with {"max_count":10}. Do not retry and do not use raw HTTP or RPC tools. Return checked, payment_verified, pending, needs_review, and incomplete counts plus only bounded anomaly and incomplete IDs supplied by the tool. If payment_verified, needs_review, or incomplete is non-zero, send a compact operator alert. If all three are zero, return exactly NO_REPLY[INFO]: no new Recebi activity. Never infer payment from an error.'
+prompt='Run exactly one Recebi background reconciliation pass. Call only recebi__recebi_reconcile_open with {"max_count":10}. Do not retry and do not use raw HTTP or RPC tools. If terminal contains records, send one concise structured alert per record using the supplied receivable_id, status, expected_amount, received_amount, reason, and explorer_url. Render signatures only as Signature: [View in Solana Explorer](explorer_url); never print the raw signature. If payment_verified, needs_review, or incomplete is non-zero, report only those bounded records. If all three are zero, return exactly NO_REPLY[INFO]: no new Recebi activity. Never infer payment from an error.'
 
 if [[ ! $job_id =~ ^[A-Za-z0-9-]{8,128}$ ]]; then
   printf '%s\n' 'invalid cron job ID' >&2
@@ -84,8 +84,8 @@ done
 }
 
 schema_ok=$(sqlite3 "$cron_db" \
-  "SELECT COUNT(*) FROM pragma_table_info('cron_jobs') WHERE name IN ('id','expression','prompt','delivery','allowed_tools','uses_memory','agent_alias');")
-[[ $schema_ok == 7 ]] || {
+  "SELECT COUNT(*) FROM pragma_table_info('cron_jobs') WHERE name IN ('id','expression','prompt','delivery','allowed_tools','uses_memory','agent_alias','enabled');")
+[[ $schema_ok == 8 ]] || {
   printf '%s\n' 'cron database does not have the expected ZeroClaw schema' >&2
   exit 2
 }
@@ -128,7 +128,8 @@ BEGIN IMMEDIATE;
 UPDATE cron_jobs
 SET prompt = :prompt,
     delivery = :delivery,
-    uses_memory = 0
+    uses_memory = 0,
+    enabled = 1
 WHERE id = :job_id;
 SELECT changes();
 COMMIT;
@@ -139,14 +140,15 @@ SQL
   exit 4
 }
 
-IFS=$'\t' read -r actual_expression actual_delivery actual_tools actual_memory actual_agent < <(
-  sqlite3 -separator $'\t' "$cron_db" \
-    "SELECT expression,delivery,allowed_tools,uses_memory,agent_alias FROM cron_jobs WHERE id='$job_id';"
+IFS='|' read -r actual_expression actual_delivery actual_tools actual_memory actual_agent actual_enabled < <(
+  sqlite3 -separator '|' "$cron_db" \
+    "SELECT expression,delivery,allowed_tools,uses_memory,agent_alias,enabled FROM cron_jobs WHERE id='$job_id';"
 )
 [[ $actual_expression == "$expression" &&
    $actual_delivery == "$delivery" &&
    $actual_tools == "[\"$tool_name\"]" &&
    $actual_memory == 0 &&
+   $actual_enabled == 1 &&
    $actual_agent == "$agent_alias" ]] || {
   printf '%s\n' 'post-update cron verification failed; inspect the backup before retrying' >&2
   exit 4
@@ -159,4 +161,5 @@ fi
 printf 'Recebi cron configured: %s\n' "$job_id"
 printf '  schedule: %s (Africa/Lagos)\n' "$actual_expression"
 printf '  delivery: Telegram peer %s (announce, fail closed)\n' "$telegram_chat_id"
+printf '  enabled:  yes\n'
 printf '  backup:   %s (sha256 %s)\n' "$backup_path" "$(sha256sum "$backup_path" | awk '{print $1}')"

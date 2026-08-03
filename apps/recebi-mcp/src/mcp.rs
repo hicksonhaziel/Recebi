@@ -10,8 +10,8 @@ use crate::{
     close_month::{CloseMonthInput, CloseMonthService, SnapshotMonthInput},
     ptax::HttpBcbPtax,
     reconcile::{
-        CheckInput, ReconcileOpenInput, ReconciliationService, ResolveReviewInput,
-        WatchPaymentInput,
+        CheckInput, HotReconcileInput, ReconcileOpenInput, ReconciliationService,
+        ResolveReviewInput, WatchPaymentInput,
     },
     rpc::HttpSolanaRpc,
 };
@@ -102,6 +102,7 @@ fn dispatch(
                 render_qr_tool_schema(),
                 check_tool_schema(),
                 watch_payment_tool_schema(),
+                hot_reconcile_tool_schema(),
                 reconcile_open_tool_schema(),
                 snapshot_month_tool_schema(),
                 close_month_tool_schema()
@@ -139,6 +140,9 @@ fn call_tool(
         Some("recebi_check") => call_check(reconciliation, id, params.get("arguments")),
         Some("recebi_watch_payment") => {
             call_watch_payment(reconciliation, id, params.get("arguments"))
+        }
+        Some("recebi_hot_reconcile") => {
+            call_hot_reconcile(reconciliation, id, params.get("arguments"))
         }
         Some("recebi_reconcile_open") => {
             call_reconcile_open(reconciliation, id, params.get("arguments"))
@@ -232,6 +236,18 @@ fn call_reconcile_open(
         return error_response(id, -32602, "invalid_reconcile_open_arguments");
     };
     tool_result(id, reconciliation.reconcile_open(input))
+}
+
+fn call_hot_reconcile(
+    reconciliation: &ReconciliationService<HttpSolanaRpc>,
+    id: &Value,
+    arguments: Option<&Value>,
+) -> Value {
+    let arguments = arguments.cloned().unwrap_or_else(|| json!({}));
+    let Ok(input) = serde_json::from_value::<HotReconcileInput>(arguments) else {
+        return error_response(id, -32602, "invalid_hot_reconcile_arguments");
+    };
+    tool_result(id, reconciliation.hot_reconcile(input))
 }
 
 fn tool_result<T: serde::Serialize, E: std::fmt::Display>(
@@ -417,7 +433,7 @@ fn check_tool_schema() -> Value {
 fn watch_payment_tool_schema() -> Value {
     json!({
         "name": "recebi_watch_payment",
-        "description": "Run one stock-ZeroClaw-safe watch window for an expected receivable. Each window checks finalized Solana evidence immediately and once more after 10 seconds. Start with window 1 and increment only when outcome is continue, up to window 4. Stop immediately on any other outcome. It never signs or submits.",
+        "description": "Run one bounded manual watch window for an expected receivable. Each window checks finalized Solana evidence immediately and once more after 5 seconds. Automatic invoice monitoring uses recebi_hot_reconcile instead. It never signs or submits.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -441,6 +457,14 @@ fn reconcile_open_tool_schema() -> Value {
             },
             "additionalProperties": false
         }
+    })
+}
+
+fn hot_reconcile_tool_schema() -> Value {
+    json!({
+        "name": "recebi_hot_reconcile",
+        "description": "Run one deterministic five-second hot-monitoring pass for receivables created in the last three minutes. Older invoices are left to the five-minute background pass. It never signs or submits.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
     })
 }
 
@@ -474,8 +498,8 @@ mod tests {
 
     use super::{
         close_month_tool_schema, create_request_tool_schema, dispatch, encode_response,
-        health_tool_schema, render_qr_tool_schema, snapshot_month_tool_schema,
-        watch_payment_tool_schema,
+        health_tool_schema, hot_reconcile_tool_schema, render_qr_tool_schema,
+        snapshot_month_tool_schema, watch_payment_tool_schema,
     };
     use crate::{
         close_month::CloseMonthService,
@@ -565,6 +589,9 @@ max_open_reconcile = 10
                 .len(),
             2
         );
+        let hot_schema = hot_reconcile_tool_schema();
+        assert_eq!(hot_schema["name"], "recebi_hot_reconcile");
+        assert_eq!(hot_schema["inputSchema"]["properties"], json!({}));
         let (_directory, health, receivables, reconciliation, closing) = services();
         let listed = dispatch(
             &health,
