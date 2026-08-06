@@ -62,6 +62,20 @@ automatically after creation. The manual `recebi__recebi_watch_payment` tool
 is only for explicit operator troubleshooting and must use the supplied
 `receivable_id` and a numbered window from 1 through 4.
 
+## Check an invoice
+
+When the operator says `check <receivable_id>`, asks for its status, or asks
+whether it was paid, call `recebi__recebi_check` exactly once with only:
+
+```json
+{"receivable_id":"<supplied receivable_id>"}
+```
+
+Use the identifier exactly as supplied. For this intent, do not call
+`reaction`, `schedule`, an SOP, a watch tool, or any other tool, and do not
+retry automatically. Report the returned state literally using the payment
+messages below.
+
 ## Payment messages
 
 Use concise structured messages. Do not add generic LLM explanations. Never
@@ -97,6 +111,15 @@ and the recorded `variance_reason`; never call it an exact payment. For
 For Portuguese messages, use concise equivalents such as `Pagamento exato
 verificado e registrado.` and `Continua não pago e requer revisão: <reason>.`
 Do not translate identifiers, reasons, or action names.
+
+## Monthly report
+
+For `recebi__recebi_close_month`, report only the bounded payment and valuation
+counts, artifact kind, and revision. Do not show any SHA-256 hashes.
+Never show `export_directory` or any local filesystem path in Telegram. End
+the reply with the exact `accountant_csv_attachment_marker` returned by the
+tool; ZeroClaw removes that marker and uploads the accountant CSV as a
+document.
 
 ## Automatic monitoring
 

@@ -45,7 +45,9 @@ pub struct CloseMonthOutput {
     pub evidence_json_sha256: String,
     pub accountant_csv_sha256: String,
     pub manifest_sha256: String,
-    pub export_directory: String,
+    /// Telegram consumes this marker and uploads the CSV as a document. The
+    /// local path is intentionally not intended for display in chat.
+    pub accountant_csv_attachment_marker: String,
     pub note: &'static str,
 }
 
@@ -265,7 +267,12 @@ impl<P: PtaxClient> CloseMonthService<P> {
             evidence_json_sha256: evidence_hash,
             accountant_csv_sha256: csv_hash,
             manifest_sha256: manifest_hash,
-            export_directory: directory.display().to_string(),
+            accountant_csv_attachment_marker: format!(
+                "[DOCUMENT:{}]",
+                directory
+                    .join(format!("recebi-{month}.accountant.csv"))
+                    .display()
+            ),
             note: "Accountant-ready evidence that may assist record keeping; not tax or legal advice.",
         })
     }
@@ -885,6 +892,17 @@ max_open_reconcile = 10
             .expect("idempotent close");
         assert_eq!(first.evidence_json_sha256, second.evidence_json_sha256);
         assert_eq!(first.valued, 1);
+        let chat_output = serde_json::to_value(&first).expect("chat output");
+        assert_eq!(
+            chat_output["accountant_csv_attachment_marker"],
+            format!(
+                "[DOCUMENT:{}]",
+                directory
+                    .path()
+                    .join("data/exports/closed/2025-07/revision-1/recebi-2025-07.accountant.csv")
+                    .display()
+            )
+        );
         let rows = store
             .list_settled_between(1_751_328_000, 1_754_006_400)
             .expect("rows");
@@ -1005,7 +1023,11 @@ max_open_reconcile = 10
         assert_eq!(snapshot.status, "snapshot_created");
         assert_eq!(snapshot.artifact_kind, "provisional_snapshot");
         assert_eq!(snapshot.revision, None);
-        assert!(snapshot.export_directory.contains("/snapshots/2025-07/"));
+        assert!(
+            snapshot
+                .accountant_csv_attachment_marker
+                .contains("/snapshots/2025-07/")
+        );
         assert!(matches!(
             service.export_at("2025-08", ExportMode::ProvisionalSnapshot, july_2025),
             Err(CloseMonthError::FutureMonth)
@@ -1097,14 +1119,27 @@ max_open_reconcile = 10
             0o700
         );
         assert_eq!(
-            std::fs::metadata(&output.export_directory)
-                .expect("export metadata")
-                .permissions()
-                .mode()
+            std::fs::metadata(
+                output
+                    .accountant_csv_attachment_marker
+                    .trim_start_matches("[DOCUMENT:")
+                    .trim_end_matches(']')
+                    .rsplit_once('/')
+                    .map_or_else(|| panic!("invalid attachment marker"), |(dir, _)| dir),
+            )
+            .expect("export metadata")
+            .permissions()
+            .mode()
                 & 0o777,
             0o700
         );
-        for entry in std::fs::read_dir(&output.export_directory).expect("export files") {
+        let export_directory = output
+            .accountant_csv_attachment_marker
+            .trim_start_matches("[DOCUMENT:")
+            .trim_end_matches(']')
+            .rsplit_once('/')
+            .map_or_else(|| panic!("invalid attachment marker"), |(dir, _)| dir);
+        for entry in std::fs::read_dir(export_directory).expect("export files") {
             assert_eq!(
                 entry
                     .expect("entry")

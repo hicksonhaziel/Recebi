@@ -398,7 +398,7 @@ fn render_qr_tool_schema() -> Value {
 fn close_month_tool_schema() -> Value {
     json!({
         "name": "recebi_close_month",
-        "description": "Finalize a completed UTC month, attach bounded official same-day BCB PTAX evidence where available, and atomically publish deterministic accountant-ready JSON/CSV/manifest files. The active or a future month is rejected.",
+        "description": "Finalize a completed UTC month, attach bounded official same-day BCB PTAX evidence where available, and atomically publish deterministic accountant-ready JSON/CSV/manifest files. Returns a Telegram document marker for the CSV; never display local filesystem paths. The active or a future month is rejected.",
         "inputSchema": {
             "type": "object",
             "properties": {
