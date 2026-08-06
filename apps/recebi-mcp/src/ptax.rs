@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use recebi_core::{
     PtaxDate, PtaxDecimal, PtaxEvidence, PtaxQuoteCandidate,
-    limits::{MAX_PTAX_RESPONSE_BYTES, RPC_TIMEOUT_SECS},
+    limits::{MAX_PTAX_RESPONSE_BYTES, PTAX_MAX_ATTEMPTS, PTAX_RETRY_DELAY_MS, PTAX_TIMEOUT_SECS},
     select_strict_same_day_quote,
 };
 use serde::Deserialize;
@@ -49,7 +49,7 @@ impl HttpBcbPtax {
         let config = Config::builder()
             .https_only(true)
             .max_redirects(0)
-            .timeout_global(Some(Duration::from_secs(RPC_TIMEOUT_SECS)))
+            .timeout_global(Some(Duration::from_secs(PTAX_TIMEOUT_SECS)))
             .build();
         Ok(Self {
             agent: config.new_agent(),
@@ -79,11 +79,20 @@ impl PtaxClient for HttpBcbPtax {
         retrieved_at_unix_ms: i64,
     ) -> Result<Option<PtaxEvidence>, PtaxError> {
         let url = self.request_url(operation_date)?;
-        let mut response = self
-            .agent
-            .get(url.as_str())
-            .call()
-            .map_err(|_| PtaxError::Unavailable)?;
+        // A cold TLS handshake to the official endpoint can exceed a single
+        // attempt window. Retry the transport a bounded number of times; a
+        // non-success status is not retried.
+        let mut attempt = 1;
+        let mut response = loop {
+            match self.agent.get(url.as_str()).call() {
+                Ok(response) => break response,
+                Err(_) if attempt < PTAX_MAX_ATTEMPTS => {
+                    std::thread::sleep(Duration::from_millis(PTAX_RETRY_DELAY_MS));
+                    attempt += 1;
+                }
+                Err(_) => return Err(PtaxError::Unavailable),
+            }
+        };
         if !response.status().is_success() {
             return Err(PtaxError::Unavailable);
         }
@@ -238,7 +247,7 @@ mod tests {
         assert_eq!(config.max_redirects(), 0);
         assert_eq!(
             config.timeouts().global,
-            Some(Duration::from_secs(RPC_TIMEOUT_SECS))
+            Some(Duration::from_secs(PTAX_TIMEOUT_SECS))
         );
         let url = client
             .request_url(&PtaxDate::parse("2026-07-28").expect("date"))

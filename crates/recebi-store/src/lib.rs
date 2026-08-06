@@ -1516,6 +1516,86 @@ impl ReceivableStore {
             .collect()
     }
 
+    /// Returns one settled receivable with its settlement and any valuation.
+    ///
+    /// # Errors
+    ///
+    /// Integrity or storage failures fail closed. An unsettled or unknown
+    /// receivable returns `Ok(None)`.
+    pub fn settled_receivable(
+        &self,
+        receivable_id: &ReceivableId,
+    ) -> Result<Option<StoredSettledReceivable>, StoreError> {
+        self.verify_ledger_integrity()?;
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT s.signature,s.slot,s.block_time_unix,s.fingerprint,
+                        s.settlement_kind,s.expected_atomic_amount,s.atomic_amount,
+                        s.variance_reason,s.approval_run_id
+                 FROM receivables r JOIN settlements s USING(receivable_id)
+                 WHERE r.receivable_id = ?1",
+                params![receivable_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?;
+        let Some((
+            signature,
+            slot,
+            block_time,
+            fingerprint,
+            settlement_kind,
+            expected_amount,
+            received_amount,
+            variance_reason,
+            approval_run_id,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let receivable =
+            find_in(&connection, receivable_id.as_str())?.ok_or(StoreError::Integrity)?;
+        let valuation = find_valuation_in(&connection, receivable_id.as_str())?;
+        let variance_reason = variance_reason
+            .map(|reason| parse_variance_reason(&reason))
+            .transpose()?;
+        if (settlement_kind == "accepted_underpayment") != variance_reason.is_some()
+            || (settlement_kind != "exact" && settlement_kind != "accepted_underpayment")
+        {
+            return Err(StoreError::Integrity);
+        }
+        Ok(Some(StoredSettledReceivable {
+            receivable,
+            signature,
+            slot: u64::try_from(slot).map_err(|_| StoreError::Integrity)?,
+            block_time_unix: block_time.ok_or(StoreError::Integrity)?,
+            settlement_fingerprint: fingerprint,
+            settlement_kind,
+            expected_amount: AtomicAmount::new(
+                u64::try_from(expected_amount).map_err(|_| StoreError::Integrity)?,
+            ),
+            received_amount: AtomicAmount::new(
+                u64::try_from(received_amount).map_err(|_| StoreError::Integrity)?,
+            ),
+            variance_reason,
+            approval_run_id,
+            valuation,
+        }))
+    }
+
     /// Persists immutable deterministic close revisions for a month.
     ///
     /// # Errors

@@ -262,11 +262,15 @@ The hot path is a latency optimization; the background path is the durable fallb
 Payment truth and BRL valuation are independent:
 
 1. settlement is first established from finalized Solana evidence;
-2. snapshot or close requests the official BCB `CotacaoDolarDia` source;
+2. a settled receivable requests the official BCB `CotacaoDolarDia` source at check time, and snapshot or close requests it for anything still unvalued;
 3. only a same-day quote is accepted;
 4. parsed quote fields and the contemporaneous response SHA-256 are retained;
 5. fixed-point arithmetic derives the nominal BRL reference; and
 6. JSON, CSV, and a hash manifest are published atomically.
+
+Valuation at check time is strictly additive and fail-open: an unpublished quote, a source outage, or a malformed response leaves the receivable settled and unvalued, never changes payment state, and never overwrites an existing valuation. Because BCB publishes the closing quote on business days only, after the market closes, a payment is normally valued on a later check the same day. Weekend and holiday payments never receive a same-day quote and remain `valuation_pending` by policy.
+
+The official endpoint carries its own timeout and a bounded transport retry, separate from the Solana RPC bound, because a cold TLS connection to BCB can be materially slower than an RPC call. Only transport failures are retried; a non-success status, an oversized body, or a malformed payload fails closed immediately.
 
 The bounded raw BCB response bytes are not retained. The artifacts reproduce the calculation and record the digest, but they are not a self-contained archive from which the exact source response can later be reconstructed or independently rehashed.
 

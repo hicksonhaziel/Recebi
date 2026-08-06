@@ -7,12 +7,13 @@ use std::{
 
 use getrandom::fill;
 use recebi_core::{
-    GenesisHash, ReceivableId, ReceivableState, ReviewResolutionAction, SettlementAssessment,
-    SettlementExpectation, SettlementVerdict, UnderpaymentEvidence, VarianceReason,
-    assess_settlement_once, decode_transaction,
+    GenesisHash, PtaxDate, PtaxDecimal, ReceivableId, ReceivableState, ReviewResolutionAction,
+    SettlementAssessment, SettlementExpectation, SettlementVerdict, UnderpaymentEvidence,
+    VarianceReason, assess_settlement_once, decode_transaction,
     limits::{MAX_ANOMALY_SAMPLES, MAX_RECONCILE_RECEIVABLES},
+    nominal_brl_reference_cents,
 };
-use recebi_store::{ReceivableStore, StoreError, StoredReceivable};
+use recebi_store::{ReceivableStore, StoreError, StoredReceivable, StoredValuation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -202,6 +203,9 @@ pub struct ReconciliationService<R: SolanaRpc> {
     config: AppConfig,
     store: ReceivableStore,
     rpc: R,
+    /// Optional official PTAX source used only to value already-settled
+    /// receivables. It can never influence the settlement predicate.
+    ptax: Option<std::sync::Arc<dyn crate::ptax::PtaxClient>>,
 }
 
 impl ReconciliationService<HttpSolanaRpc> {
@@ -212,7 +216,15 @@ impl ReconciliationService<HttpSolanaRpc> {
         let store = ReceivableStore::open(config.database_path())
             .map_err(|_| ReconcileError::StorageUnavailable)?;
         let rpc = HttpSolanaRpc::new(config.recebi.rpc_url.clone());
-        Ok(Self { config, store, rpc })
+        let ptax = crate::ptax::HttpBcbPtax::new().ok().map(|client| {
+            std::sync::Arc::new(client) as std::sync::Arc<dyn crate::ptax::PtaxClient>
+        });
+        Ok(Self {
+            config,
+            store,
+            rpc,
+            ptax,
+        })
     }
 }
 
@@ -224,7 +236,12 @@ impl<R: SolanaRpc> ReconciliationService<R> {
             .map_err(|_| ReconcileError::StorageUnavailable)?;
         let store = ReceivableStore::open(config.database_path())
             .map_err(|_| ReconcileError::StorageUnavailable)?;
-        Ok(Self { config, store, rpc })
+        Ok(Self {
+            config,
+            store,
+            rpc,
+            ptax: None,
+        })
     }
 
     pub fn check(&self, input: CheckInput) -> Result<CheckResult, ReconcileError> {
@@ -931,11 +948,65 @@ impl<R: SolanaRpc> ReconciliationService<R> {
         })
     }
 
+    /// Attempts one strict same-day official PTAX valuation for an already
+    /// settled receivable so the operator sees the BRL reference at payment
+    /// time instead of only at month close.
+    ///
+    /// Valuation is fail-open: an unpublished quote, an outage, or a malformed
+    /// response leaves the receivable settled and unvalued. It can never change
+    /// payment state, and it never overwrites an existing valuation.
+    fn try_value_settled(&self, id: &ReceivableId) -> Result<(), ReconcileError> {
+        let Some(ptax) = self.ptax.as_ref() else {
+            return Ok(());
+        };
+        let Some(row) = self
+            .store
+            .settled_receivable(id)
+            .map_err(|error| map_store(&error))?
+        else {
+            return Ok(());
+        };
+        if row.valuation.is_some() {
+            return Ok(());
+        }
+        let Ok(operation_date) = PtaxDate::from_unix_seconds(row.block_time_unix) else {
+            return Ok(());
+        };
+        let Ok(Some(evidence)) = ptax.quote(&operation_date, now_unix_ms()?) else {
+            return Ok(());
+        };
+        let Ok(sale) = PtaxDecimal::parse(&evidence.sale) else {
+            return Ok(());
+        };
+        let Ok(brl_reference_cents) = nominal_brl_reference_cents(
+            row.received_amount,
+            self.config.recebi.token_decimals,
+            sale,
+        ) else {
+            return Ok(());
+        };
+        match self.store.attach_valuation(
+            id,
+            &StoredValuation {
+                evidence,
+                brl_reference_cents,
+            },
+        ) {
+            // A concurrent valuation or a state change since the read above is
+            // not an error for reporting; only integrity must surface.
+            Ok(()) | Err(StoreError::InvalidTransition | StoreError::Unavailable) => Ok(()),
+            Err(error) => Err(map_store(&error)),
+        }
+    }
+
     fn official_ptax_status(
         &self,
         id: &ReceivableId,
         settled: bool,
     ) -> Result<OfficialPtaxStatus, ReconcileError> {
+        if settled {
+            self.try_value_settled(id)?;
+        }
         let valuation = self
             .store
             .valuation(id)
@@ -1062,7 +1133,7 @@ fn pending_result(receivable_id: &ReceivableId) -> CheckResult {
 
 fn official_ptax_pending() -> OfficialPtaxStatus {
     OfficialPtaxStatus {
-        status: "pending_monthly_close",
+        status: "quote_not_yet_published",
         operation_date: None,
         quote_date: None,
         purchase: None,
@@ -1418,6 +1489,83 @@ max_open_reconcile = 10
                 },
             ],
         }
+    }
+
+    #[test]
+    fn settled_payment_is_valued_at_payment_time_with_official_quote() {
+        struct FixedPtax {
+            result: Result<Option<recebi_core::PtaxEvidence>, crate::ptax::PtaxError>,
+        }
+        impl crate::ptax::PtaxClient for FixedPtax {
+            fn quote(
+                &self,
+                _date: &PtaxDate,
+                _retrieved_at_unix_ms: i64,
+            ) -> Result<Option<recebi_core::PtaxEvidence>, crate::ptax::PtaxError> {
+                self.result.clone()
+            }
+        }
+
+        let (_directory, mut service, id) = setup(100_000, false);
+        // Without an official quote the receivable settles and stays unvalued.
+        service.ptax = Some(Arc::new(FixedPtax { result: Ok(None) }));
+        let pending = service
+            .check(CheckInput {
+                receivable_id: id.as_str().to_owned(),
+            })
+            .expect("check");
+        assert_eq!(pending.status, CheckStatus::PaymentVerified);
+        assert_eq!(pending.official_ptax.status, "quote_not_yet_published");
+        assert!(pending.official_ptax.brl_reference.is_none());
+
+        // A source outage must not change payment state either.
+        service.ptax = Some(Arc::new(FixedPtax {
+            result: Err(crate::ptax::PtaxError::Unavailable),
+        }));
+        let outage = service
+            .check(CheckInput {
+                receivable_id: id.as_str().to_owned(),
+            })
+            .expect("check");
+        assert_eq!(outage.status, CheckStatus::PaymentVerified);
+        assert_eq!(outage.official_ptax.status, "quote_not_yet_published");
+
+        // Once the official same-day closing quote exists, the same check
+        // reports the verified rate and the nominal BRL reference.
+        let quote_date = PtaxDate::from_unix_seconds(
+            service
+                .store
+                .settled_receivable(&id)
+                .expect("settled")
+                .expect("row")
+                .block_time_unix,
+        )
+        .expect("date");
+        service.ptax = Some(Arc::new(FixedPtax {
+            result: Ok(Some(recebi_core::PtaxEvidence {
+                operation_date: quote_date.clone(),
+                quote_date,
+                purchase: "5.11480".to_owned(),
+                sale: "5.11540".to_owned(),
+                bulletin_type: None,
+                bulletin_timestamp: "2026-08-05 13:06:43.148328".to_owned(),
+                retrieved_at_unix_ms: 1,
+                response_sha256: "cd".repeat(32),
+                source_id: "bcb_ptax_v1_cotacao_dolar_dia".to_owned(),
+                policy_version: "strict_same_day_closing_v1".to_owned(),
+            })),
+        }));
+        let valued = service
+            .check(CheckInput {
+                receivable_id: id.as_str().to_owned(),
+            })
+            .expect("check");
+        assert_eq!(valued.status, CheckStatus::PaymentVerified);
+        assert_eq!(valued.official_ptax.status, "bcb_verified");
+        assert_eq!(valued.official_ptax.sale.as_deref(), Some("5.11540"));
+        // 0.1 USDC nominal at 5.11540 BRL/USD rounds half-up to 0.51 BRL.
+        assert_eq!(valued.official_ptax.brl_reference.as_deref(), Some("0.51"));
+        service.store.verify_event_chain().expect("event chain");
     }
 
     #[test]

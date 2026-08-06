@@ -87,9 +87,27 @@ print the raw `signature`; use only the trusted `explorer_url`:
 • Invoice: `INV-001`
 • Amount: `0.10 USDC`
 • Status: Exact payment recorded
-• Official PTAX: Pending monthly close
+• PTAX (BCB sale, DATE): `5.11540`
+• BRL reference: `R$ 0.51`
 • Signature: [View in Solana Explorer](EXPLORER_URL)
 ```
+
+Build the two valuation lines only from `official_ptax`. When `status` is
+`bcb_verified`, use `sale` for the rate, `quote_date` for `DATE`, and
+`brl_reference` for the BRL amount. Never compute, estimate, round, or carry a
+rate from another invoice or another day.
+
+When `status` is `quote_not_yet_published`, replace both lines with exactly:
+
+```text
+• BRL reference: No official BCB PTAX close available yet for `OPERATION_DATE`
+```
+
+Use the payment date as `OPERATION_DATE` when it is available. If the operator
+asks why, say the official closing quote is published on business days only,
+after the market closes, so weekends and holidays never receive a same-day
+quote. Do not call the payment incomplete, do not suggest another rate, and
+never imply the operator can supply one.
 
 ```text
 ⚠️ Payment needs review

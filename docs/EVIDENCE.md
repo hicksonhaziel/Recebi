@@ -142,6 +142,18 @@ Historical entries below preserve the terminology and tool counts that were curr
   - after dropping those triggers, the rewritten event row and a zeroed checkpoint root were both still detected, exit `4` in each case. Detection therefore does not depend on the triggers surviving.
 - Boundary: this is a same-host drill. Provisioning a separate machine from backups alone is still unproven.
 
+## 2026-08-06 — Payment-time PTAX valuation and BCB timeout fix
+
+- Before this change, valuation was attempted only during snapshot or month close, so a freshly paid receivable always reported no BRL reference regardless of whether an official quote existed.
+- A settled receivable now attempts one strict same-day official quote when it is checked. The policy is unchanged: same operation date, closing bulletin, no weekend or nearest-day substitution.
+- Diagnosing why the first attempt still failed exposed a real defect: the PTAX client reused the 5-second Solana RPC timeout, while a cold TLS connection to `olinda.bcb.gov.br` measured 11.2 seconds on the operator's connection and 1.9 seconds warm. Every cold valuation was silently failing as a transport timeout. PTAX now has its own 20-second bound and up to three bounded transport attempts; non-success statuses, oversized bodies, and malformed payloads still fail closed on the first response.
+- Live verification against the official endpoint, self-operated devnet receivables:
+  - `AUTO-FIX-001` and `PHASE7-HOT-001`, paid 2026-08-03, returned `bcb_verified` with sale `5.07230`, quote date `2026-08-03`, and nominal BRL references `0.05` and `0.51`;
+  - `BOUNTY-POST-PAYOUT`, paid Sunday 2026-08-02, remains unvalued because no same-day quote exists;
+  - `INJECT-MEMO-001`, paid earlier on 2026-08-06, remained unvalued because that day's closing quote was not yet published. Direct endpoint reads confirmed the cause: `2026-08-06` returned an empty value set, `2026-08-05` returned `5.11480/5.11540` stamped `13:06:43` BRT.
+- Stored valuations rose from 2 to 12 without any payment state change.
+- Boundary: fail-open valuation cannot eliminate `valuation_pending`. Weekend and holiday payments never qualify under a strict same-day policy, and a payment made before the daily publication is valued only on a later check.
+
 ## Evidence still required before stronger claims
 
 - a clean installation by another operator;
