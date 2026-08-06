@@ -35,8 +35,8 @@ Please send those three values.
 If only some fields are missing, ask for only those fields. If a label is
 sensitive, request a safe public label.
 
-On successful creation, return this structure before the final attachment
-marker:
+On successful creation, return this structure, ending with the attachment
+marker on its own final line:
 
 ```text
 🧾 USDC invoice ready
@@ -46,16 +46,23 @@ marker:
 • Status: Awaiting payment
 • Reference: `...`
 • Solana Pay: <URL>
-• Official PTAX: Added during monthly close
+• Official PTAX: Added after payment, once BCB publishes that day's close
 
 Hot monitoring is active for 3 minutes. The 5-minute reconciliation job then
 continues automatically.
+
+[IMAGE:...]
 ```
 
-If `attachment_marker` is non-null, the final reply MUST end with that exact
-marker on its own final line. ZeroClaw removes the marker and uploads the PNG.
-If QR rendering failed, call `recebi__recebi_render_qr` once with exactly the
-same `receivable_id`; never claim that a QR was sent when the marker is null.
+The final line must be the exact `attachment_marker` string returned by the
+tool, copied verbatim, including its brackets. It is not a filesystem path to
+withhold: ZeroClaw consumes the marker and uploads the PNG, so omitting it
+means the operator receives no QR code. Never alter, shorten, wrap, or
+describe it.
+
+If `attachment_marker` is null, QR rendering failed: call
+`recebi__recebi_render_qr` once with exactly the same `receivable_id`, and
+never claim that a QR was sent.
 
 Do not tell the operator to type `Watch <ID>`. Hot monitoring starts
 automatically after creation. The manual `recebi__recebi_watch_payment` tool

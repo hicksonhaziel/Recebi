@@ -150,6 +150,16 @@ install -m 600 zeroclaw/skills/recebi/SKILL.md \
 
 The skill defines narrow intent mapping and response shaping. It does not establish payment truth.
 
+Confirm exactly one `SKILL.md` exists under the bundle directory before restarting:
+
+```bash
+find "$HOME/.zeroclaw" -name SKILL.md -path '*recebi*'
+```
+
+A ZeroClaw bundle can resolve a nested `<bundle>/<skill>/SKILL.md`, so it is easy to end up with two copies at different depths. If a stale copy exists at a different depth from the one the runtime loads, the agent silently follows the old instructions: message templates, attachment markers, and valuation wording all revert with no error anywhere in the logs. Keep one file, or keep every copy identical.
+
+After any skill change, restart ZeroClaw and send `/new`. Session context is captured when the session starts.
+
 ## 6. Install the approval SOP
 
 Copy the SOP files into the private `sops_dir` configured in ZeroClaw:

@@ -199,7 +199,7 @@ fn result_from(
         attachment_marker,
         qr_error,
         custody: "none",
-        official_ptax: "added_during_monthly_close",
+        official_ptax: "added_after_payment_when_quote_published",
     }
 }
 
