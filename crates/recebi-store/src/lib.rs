@@ -17,6 +17,12 @@ use thiserror::Error;
 
 const EVENT_DOMAIN: &str = "recebi.receivable_event.v1";
 const EVENT_SCHEMA_VERSION: i64 = 1;
+/// A deployment can open several stores at once: the `ZeroClaw` session server,
+/// a scheduled reconcile job, and an operator command. Opening runs schema
+/// creation and integrity verification inside a write transaction, so a short
+/// busy timeout made concurrent startup fail as `Unavailable`. This bound waits
+/// instead of failing, while still guaranteeing forward progress.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum StoreError {
@@ -132,7 +138,7 @@ impl ReceivableStore {
         };
         let connection = store.connection()?;
         connection.execute_batch(
-            "BEGIN;
+            "BEGIN IMMEDIATE;
              CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS receivables (
                  receivable_id TEXT PRIMARY KEY NOT NULL,
@@ -284,7 +290,7 @@ impl ReceivableStore {
     fn connection(&self) -> Result<Connection, StoreError> {
         let connection = Connection::open(&self.path).map_err(|_| StoreError::Unavailable)?;
         connection
-            .busy_timeout(Duration::from_secs(3))
+            .busy_timeout(BUSY_TIMEOUT)
             .map_err(|_| StoreError::Unavailable)?;
         connection
             .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
@@ -1685,7 +1691,16 @@ impl ReceivableStore {
     ///
     /// Any missing, malformed, or mismatched checkpoint fails closed.
     pub fn verify_ledger_integrity(&self) -> Result<(), StoreError> {
-        verify_ledger_integrity_in(&self.connection()?)
+        // The event chain, material tables, and checkpoint chain must be read
+        // from one snapshot. Separate statements on a bare connection can
+        // straddle another writer's commit and report a torn view as an
+        // integrity failure.
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|_| StoreError::Unavailable)?;
+        verify_ledger_integrity_in(&transaction)?;
+        transaction.commit().map_err(|_| StoreError::Unavailable)
     }
 }
 
@@ -2903,6 +2918,43 @@ mod tests {
             )
             .expect("tamper");
         assert_eq!(store.verify_ledger_integrity(), Err(StoreError::Integrity));
+    }
+
+    #[test]
+    fn concurrent_opens_all_succeed() {
+        // A deployment opens the store from the session server, a scheduled
+        // job, and operator commands at the same time. Schema creation runs in
+        // an immediate transaction so contention waits instead of failing.
+        let directory = tempfile::tempdir().expect("dir");
+        let path = directory.path().join("recebi.sqlite3");
+        ReceivableStore::open(&path).expect("initial store");
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let store = ReceivableStore::open(&path).expect("concurrent open");
+                    store
+                        .create_or_get(request(&format!("CONCURRENT-OPEN-{index}"), index + 1), 100)
+                        .expect("create");
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+        let store = ReceivableStore::open(&path).expect("store");
+        store.verify_ledger_integrity().expect("integrity");
+        for index in 0..8 {
+            assert!(
+                store
+                    .get(&ReceivableId::new(format!("CONCURRENT-OPEN-{index}")).expect("id"))
+                    .expect("get")
+                    .is_some()
+            );
+        }
     }
 
     #[test]

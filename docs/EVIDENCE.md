@@ -154,6 +154,15 @@ Historical entries below preserve the terminology and tool counts that were curr
 - Stored valuations rose from 2 to 12 without any payment state change.
 - Boundary: fail-open valuation cannot eliminate `valuation_pending`. Weekend and holiday payments never qualify under a strict same-day policy, and a payment made before the daily publication is valued only on a later check.
 
+## 2026-08-06 — Concurrent startup and torn-snapshot defects
+
+- Symptom: ZeroClaw logged `recebi-mcp storage error: local receivable storage is unavailable` on restart, and an earlier session's Telegram channel failed to start behind it.
+- Reproduced deterministically: eight simultaneous MCP initialisations against the live ledger failed 1–2 times per run.
+- First defect: schema creation opened a deferred transaction, so a concurrent opener hit an immediate upgrade conflict that the SQLite busy handler never retries. Raising the busy timeout alone did not help, which confirmed the diagnosis. Schema creation now uses `BEGIN IMMEDIATE`, and the busy bound is 20 seconds. Sixteen consecutive concurrent initialisations then succeeded with no error.
+- Second defect, found by the new regression test: `verify_ledger_integrity` read the event chain, material tables, and checkpoint chain as separate statements on a bare connection. Under concurrent distinct mutations those reads could straddle another writer's commit and report a torn view as `Integrity` — a spurious integrity failure on sound data. Verification now pins one read snapshot, matching the existing behavior of `ledger_fingerprint`.
+- `concurrent_opens_all_succeed` covers both: eight threads open the store behind a barrier, each creates a distinct receivable, and the ledger verifies afterwards. It passed five consecutive runs.
+- Effect on claims: neither defect could accept an incorrect payment. Both failed closed, and the second produced a false alarm rather than a false acceptance. They degraded availability, not correctness.
+
 ## Evidence still required before stronger claims
 
 - a clean installation by another operator;
