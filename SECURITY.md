@@ -6,7 +6,7 @@ Recebi is designed so payment truth is deterministic and outside the LLM. Please
 
 Recebi is **T1 Build + T0 Read** under the ZeroClaw Solana bounty custody ladder: it creates unsigned Solana Pay requests and reads finalized chain/BCB evidence. It is never T2. No private key, seed phrase, signer, session wallet, transaction submission, refund, swap, or transfer capability exists.
 
-See the complete [threat model](docs/THREAT_MODEL.md) for trust boundaries, the prompt-injection test scenario and pending transcript requirement, residual risks, and demonstrated safety behavior.
+See the complete [threat model](docs/THREAT_MODEL.md) for trust boundaries, the observed prompt-injection transcript and unchanged-ledger proof, residual risks, and demonstrated safety behavior.
 
 ## Security invariants
 

@@ -98,6 +98,46 @@ ZeroClaw provides the operator channel and orchestration surface:
 
 The LLM can explain results but cannot establish settlement or valuation truth.
 
+## Module map
+
+The two largest files are intentionally mapped here rather than refactored immediately before the showcase.
+
+### `crates/recebi-store/src/lib.rs`
+
+| Region | Responsibility |
+|---|---|
+| `ReceivableStore` API (`~120–1609`) | Connections, atomic creation/state transitions, replay checks, leases, notifications, valuation, review, and month-close writes |
+| Integrity helpers (`~1612–1823`) | Event-chain verification, material-ledger verification, valuation lookup, and deterministic close hashing |
+| Migrations/checkpoints (`~1832–2327`) | Schema upgrades, checkpoint initialization/appending/verification, ledger-root calculation, and owner-only file modes |
+| Mapping and tests (`~2328–end`) | State migration, row decoding, canonical event encoding, concurrency, tamper, restart, and permission tests |
+
+### `apps/recebi-mcp/src/reconcile.rs`
+
+| Region | Responsibility |
+|---|---|
+| Tool contracts (`~33–200`) | Bounded inputs, statuses, outputs, notifications, and typed errors |
+| Single-receivable flow (`~201–683`) | Live construction, check/watch windows, cluster validation, candidate loading, deterministic settlement, and fail-closed results |
+| Operator and batch flow (`~684–1035`) | Review disposition, anomaly recording, bounded open/hot reconciliation, outbox acknowledgement, and PTAX status |
+| Helpers and tests (`~1036–end`) | Time/format/error/fingerprint helpers plus mocked-RPC exact, mismatch, overlap, and malformed-evidence tests |
+
+This map gives reviewers navigable boundaries while preserving the already-tested implementation.
+
+## Layering choice
+
+Recebi uses stock ZeroClaw plus a local stdio MCP, not a source-built WASM plugin. The use case is not a thin RPC wrapper: it needs SQLite/WAL persistence, append-only checkpoints, private QR/CSV/manifest files, atomic publication, local approval helpers, and OS-scheduled reconciliation. Those capabilities are not exposed together by the current plugin permission surface. Splitting only the pure verifier into WASM would leave the stateful trust boundary in a host service while adding another component boundary without reducing custody.
+
+The deterministic core remains network- and filesystem-free, so it can be reused in another host later. For this T1 Build + T0 Read system, stdio MCP keeps the release host stock, the ledger local, the interfaces bounded, and all signing capability absent.
+
+## Upstream friction and fail-closed adaptations
+
+ZeroClaw 0.8.3 behavior shaped three implementation decisions:
+
+1. A chat-local SOP engine could expose post-gate instructions before durable out-of-band approval completed. Recebi removed review mutation from discovery; the SOP now emits only a receipt, and a local helper verifies the completed run before invoking the internal mutation.
+2. The cron CLI did not expose every delivery/hardening field needed by the deployment. Installer helpers validate exact job shapes, create mode-`0600` backups, and update only the required scheduler fields.
+3. MCP discovery is session-scoped, so configuration changes require a fresh `/new` conversation. Channel references also use explicit dotted aliases such as `telegram.default`.
+
+The remaining hot-worker single-flight limitation is disclosed below rather than hidden.
+
 ## Request and settlement flow
 
 ```mermaid

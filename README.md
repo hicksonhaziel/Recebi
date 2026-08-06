@@ -123,7 +123,7 @@ It runs formatting checks, workspace Clippy with warnings denied, and workspace 
 
 ## Evidence, not claims
 
-The operator log records real Telegram interactions, exact and wrong-amount finalized devnet transfers, idempotent reconciliation, PTAX outage behavior, durable approval denial/timeout/success, process restarts, and automatic hot reconciliation. See [Evidence](docs/EVIDENCE.md).
+The operator log records real Telegram interactions, exact and wrong-amount finalized devnet transfers, idempotent reconciliation, PTAX outage behavior, durable approval denial/timeout/success, process restarts, automatic hot reconciliation, and four prompt-injection attacks with an unchanged material-ledger root. See [Evidence](docs/EVIDENCE.md).
 
 For a bounty submission, the live video and showcase post remain the submission artifacts. Repository documentation is supporting reproducibility material, not a substitute for a running demonstration.
 

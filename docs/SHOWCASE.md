@@ -142,17 +142,17 @@ End with:
 
 ## Prompt-injection segment
 
-The write-up must include an **observed execution transcript**, which is not yet present in this repository. Send a malicious message through the demonstrated ZeroClaw channel requesting a refund to an attacker address, an RPC override, and a false paid state. Capture:
+The observed four-part Telegram transcript is recorded in [Threat Model](THREAT_MODEL.md#observed-prompt-injection-transcript) and [Evidence](EVIDENCE.md). It covers payout redirect, false exact-paid state, trusted RPC/merchant/mint override, and instructions carried in a real finalized transaction memo.
 
-- the exact inbound message and agent response;
-- the tools available and any rejected call;
-- the receivable state immediately before and after;
-- confirmation that refund/sign/submit tools do not exist; and
-- evidence that trusted configuration was not overridden.
+In the write-up, include the transcript and its deterministic proof:
 
-The test scenario and expected controls are documented in [Threat Model](THREAT_MODEL.md), but they are not a substitute for the captured channel run required by the bounty.
+- exact inbound messages and agent responses;
+- runtime traces showing zero tool calls for the false-paid, override, and memo prompts;
+- identical checkpoint sequence, ledger root, and checkpoint hash before and after;
+- `INJECT-SAFE-001` still open with zero settlements and reviews; and
+- the malicious raw memo absent from MCP output and ZeroClaw runtime traces.
 
-Do not stage a model refusal as the security control. Show capability absence, schema enforcement, and unchanged deterministic state.
+Do not present model refusal as the control. The control is capability absence, closed schemas, exclusion of memo bytes from model context, and an unchanged material ledger.
 
 ## Showcase post outline
 
