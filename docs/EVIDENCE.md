@@ -18,6 +18,7 @@ This is the dated evidence record for Recebi. It separates observed behavior fro
 | Automatic hot reconciliation | Payment detected by bounded worker | Self-operated devnet |
 | Restart/idempotency | Repeated checks and daemon restarts | Local deployment |
 | Prompt-injection resistance | Four Telegram attacks plus unchanged ledger root | Self-operated devnet |
+| Backup, restore, and tamper detection | Same-host drill with verified root and fail-closed tamper paths | Local deployment |
 | Malicious transaction memo | Finalized memo-bearing payment; memo excluded from model context | Builder-operated payer |
 | Mainnet or third-party receivable | Not demonstrated | Must not be claimed |
 
@@ -128,6 +129,19 @@ Historical entries below preserve the terminology and tool counts that were curr
 - `cargo build --locked --release -p recebi-mcp` then produced the release binary in 138 seconds from the same cold target directory.
 - This establishes that the committed `Cargo.lock` builds and tests the full workspace with no network access and no prior build artifacts. It does not establish setup time, dependency installation, or configuration correctness on a foreign machine.
 
+## 2026-08-06 — Backup, restore, and tamper-detection drill
+
+- Added an operator-only offline `recebi-mcp --config <path> --verify-ledger` mode. It performs no network call, starts no MCP server, is not a discoverable tool, and exits `4` when verification fails.
+- `./scripts/restore-drill.sh` opened the live database read-only, snapshotted it through the SQLite backup API into a mode-`0700` private directory, and verified the restored copy with the release binary.
+- Result: checkpoint sequence `72`, event chain verified, checkpoint chain verified, and material-ledger root `f6b00cf46008ce72d0d4ecd0062307575c39a0ba4d88aa0ec31ce7371b411548` — identical to the root recorded during the prompt-injection session. Stored root, checkpoint hash, recomputed root, and receivable/settlement/event row counts all matched the live ledger.
+- The drill was also run against an isolated static copy as its source; the source digest was byte-identical before and after (`a5b34a91…f177c`), and the backup file equalled the source exactly. The drill therefore never writes to what it reads.
+- Repeated runs against the live database produce different whole-file digests while the material root stays constant, because a running deployment legitimately writes leases, attempt timestamps, and WAL pages. Whole-file hashing is therefore not valid ledger evidence; the material-ledger root is.
+- Negative paths on throwaway restored copies:
+  - rewriting `receivables.atomic_amount` was detected and failed closed with exit `4`;
+  - direct `UPDATE` of `receivable_events` and `ledger_checkpoints` was rejected by append-only SQLite triggers (`append_only (19)`); and
+  - after dropping those triggers, the rewritten event row and a zeroed checkpoint root were both still detected, exit `4` in each case. Detection therefore does not depend on the triggers surviving.
+- Boundary: this is a same-host drill. Provisioning a separate machine from backups alone is still unproven.
+
 ## Evidence still required before stronger claims
 
 - a clean installation by another operator;
@@ -135,7 +149,7 @@ Historical entries below preserve the terminology and tool counts that were curr
 - an exact public commit matching the video binary;
 - an independent payer or genuine business receivable;
 - mainnet operation, if mainnet is claimed;
-- a tested backup/restore drill; and
+- a recovery drill onto separate hardware, since only a same-host restore drill is validated; and
 - professional accounting/legal review, if any compliance claim is made.
 
 Add new entries only after observing the behavior. Include environment, actor ownership, transaction finality, exact Recebi state, relevant scheduler/SOP path, and any failure. Never rewrite a planned test as completed evidence.

@@ -223,4 +223,4 @@ bash -n scripts/*.sh
 6. Restart ZeroClaw and start a new Telegram session with `/new`.
 7. Check one known open and one known settled receivable.
 
-Recebi currently has no packaged release installer or automated clean-room deployment script. Treat reproducible source builds and an independently tested backup/restore procedure as operator responsibilities.
+Recebi currently has no packaged release installer or automated clean-room deployment script. It does ship an offline `--verify-ledger` mode and a non-destructive [`restore-drill.sh`](../scripts/restore-drill.sh); run both after configuration changes and before mainnet use. Reproducible source builds and a recovery procedure tested on your own separate hardware remain operator responsibilities.

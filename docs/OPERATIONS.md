@@ -246,9 +246,29 @@ Back up these items together:
 
 Store backups outside the live data directory with equivalent or stronger access controls.
 
+## Offline ledger verification
+
+The release binary can verify the local ledger without any network call, MCP session, or state mutation:
+
+```bash
+target/release/recebi-mcp --config "$HOME/.zeroclaw/recebi.toml" --verify-ledger
+```
+
+It verifies the event hash chain, the material-table root, and the checkpoint chain, then prints the material-ledger root as JSON. Exit `0` means verified; exit `4` means the ledger failed closed and must be investigated before any mutation. This is an operator command only; it is not an MCP tool and is not reachable from chat.
+
+## Restore drill
+
+```bash
+./scripts/restore-drill.sh
+```
+
+The drill is non-destructive. It opens the live database read-only, takes a consistent snapshot through the SQLite backup API, restores it into a mode-`0700` private temporary directory, verifies the restored copy with the trusted binary, and compares the checkpoint sequence, stored ledger root, checkpoint hash, recomputed root, and material row counts against the live ledger. Any mismatch exits non-zero. Pass `--keep` to retain the restored copy for inspection.
+
+Run it after configuration changes, before mainnet use, and on a schedule you can defend to an accountant.
+
 ## Recovery boundary
 
-Recebi has atomic writes, WAL, leases, integrity checks, and scheduler backups, but this repository does **not** yet ship an automated disaster-restore command or a validated clean-room recovery test.
+Recebi has atomic writes, WAL, leases, integrity checks, scheduler backups, an offline `--verify-ledger` command, and a validated same-host restore drill. It does **not** yet ship a full disaster-recovery orchestration or a clean-room recovery test on separate hardware. The drill proves a restored copy is cryptographically identical to the live ledger; it does not prove that a foreign machine can be provisioned from backups alone.
 
 Before mainnet use:
 

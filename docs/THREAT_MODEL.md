@@ -166,7 +166,7 @@ Monthly evidence may contain operator-supplied invoice identifiers and public ch
 - Host, operator, or privileged direct-stdio compromise can replace or invoke trusted operations and is out of scope.
 - The hot runner lacks a process-lifetime lock; a one-second cron requires verified same-job serialization.
 - The single-wallet, single-mint MVP intentionally rejects broader payment shapes.
-- There is no automated, validated disaster-restore workflow yet.
+- Restore is drilled and verifiable on the same host, but full disaster recovery onto separate hardware is not yet validated.
 - Current public evidence is self-operated devnet, not independent mainnet operation.
 - PTAX artifacts retain parsed fields and a response digest, not the raw source payload.
 - The prompt-injection transcript is self-operated devnet evidence; it does not establish resistance to every future model/runtime behavior.

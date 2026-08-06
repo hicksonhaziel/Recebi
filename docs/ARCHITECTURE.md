@@ -231,6 +231,8 @@ Some QR and CSV results contain absolute private paths, including attachment mar
 
 There is no operation for signing, submitting, refunding, swapping, changing trusted configuration, or accepting an arbitrary transaction as exact payment.
 
+The binary also accepts `--verify-ledger`, which verifies the event chain, material-table root, and checkpoint chain offline and exits. It is a local operator command, not an MCP tool: it opens no server, makes no network call, mutates no state, and is unreachable from chat. `scripts/restore-drill.sh` uses it to prove a restored backup is cryptographically identical to the live ledger.
+
 ## Reconciliation architecture
 
 Recebi uses polling, matching the bounty’s recommended channel-resident architecture.
