@@ -111,7 +111,11 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(error) = mcp::serve(&health, &receivables, &reconciliation, &closing) {
+    let served = mcp::serve(&health, &receivables, &reconciliation, &closing);
+    // A scheduled QR delivery outlives the request that created it, so drain it
+    // before exiting rather than discarding the operator's image.
+    delivery::wait_for_pending_deliveries();
+    if let Err(error) = served {
         eprintln!("recebi-mcp server error: {error}");
         std::process::exit(3);
     }

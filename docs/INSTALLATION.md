@@ -167,9 +167,10 @@ Optionally enable deterministic QR delivery so the operator receives the image e
 zeroclaw_bin = "/home/OPERATOR/.cargo/bin/zeroclaw"
 channel_id = "telegram"
 recipient = "TELEGRAM_CHAT_ID"
+# delay_ms = 6000
 ```
 
-Recebi then sends the QR itself and reports `qr_delivered`. Leave the block absent to keep the process boundary narrower; see [Threat model](THREAT_MODEL.md#trust-boundaries).
+Recebi then sends the QR itself shortly after the agent's reply and reports `qr_delivery`. Leave the block absent to keep the process boundary narrower; see [Threat model](THREAT_MODEL.md#trust-boundaries).
 
 ## 6. Install the approval SOP
 

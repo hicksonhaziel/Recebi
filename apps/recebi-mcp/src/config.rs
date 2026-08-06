@@ -42,6 +42,24 @@ pub struct QrDeliveryConfig {
     pub channel_id: String,
     /// Operator recipient identifier for that channel.
     pub recipient: String,
+    /// Delay before sending, so the image follows the agent's message rather
+    /// than preceding it. Defaults to `DEFAULT_QR_DELAY_MS`.
+    #[serde(default)]
+    pub delay_ms: Option<u64>,
+}
+
+/// Ordering delay that comfortably exceeds a fast model turn without making the
+/// operator wait noticeably for the image.
+const DEFAULT_QR_DELAY_MS: u64 = 6_000;
+/// Upper bound so a misconfiguration cannot retain a delivery thread for long.
+const MAX_QR_DELAY_MS: u64 = 60_000;
+
+impl QrDeliveryConfig {
+    /// Returns the bounded ordering delay.
+    #[must_use]
+    pub fn delay(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.delay_ms.unwrap_or(DEFAULT_QR_DELAY_MS))
+    }
 }
 
 impl fmt::Debug for QrDeliveryConfig {
@@ -51,6 +69,7 @@ impl fmt::Debug for QrDeliveryConfig {
             .field("zeroclaw_bin", &"[redacted]")
             .field("channel_id", &self.channel_id)
             .field("recipient", &"[redacted]")
+            .field("delay_ms", &self.delay_ms)
             .finish()
     }
 }
@@ -172,6 +191,9 @@ impl AppConfig {
                 || !delivery.zeroclaw_bin.is_file()
                 || !safe(&delivery.channel_id, 32)
                 || !safe(&delivery.recipient, 64)
+                || delivery
+                    .delay_ms
+                    .is_some_and(|delay| delay > MAX_QR_DELAY_MS)
             {
                 return Err(ConfigError::Invalid);
             }

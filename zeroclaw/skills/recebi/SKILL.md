@@ -22,14 +22,14 @@ accept a wallet, mint, RPC URL, path, signature, or private information.
 
 ## QR delivery is deterministic
 
-Recebi delivers the QR image itself. Read `qr_delivered` from the tool result:
+Recebi delivers the QR image itself, shortly after your reply, so the image
+follows the message that explains it. Read `qr_delivery` from the tool result:
 
-- `true` — the QR was already sent as a separate image. Do not repeat, describe,
-  or attach anything. Simply state that the QR code was sent.
-- `false` — delivery failed. Say the QR could not be delivered and end your
-  reply with the exact `attachment_marker` on its own final line.
-- absent or `null` — no delivery channel is configured. End your reply with the
-  exact `attachment_marker` on its own final line.
+- `"scheduled"` — Recebi is sending the image. Say the QR code follows, and do
+  not attach, repeat, or describe anything else.
+- `"unavailable"` — no delivery channel is configured, or the artifact cannot be
+  delivered. End your reply with the exact `attachment_marker` on its own final
+  line.
 
 An `attachment_marker` such as `[IMAGE:/abs/path.png]` is a delivery
 instruction for ZeroClaw, not information for the reader. When the rules above
@@ -67,14 +67,14 @@ On successful creation, return this structure:
 • Reference: `...`
 • Solana Pay: <URL>
 • Official PTAX: Added after payment, once BCB publishes that day's close
-• QR code: Sent as an image
+• QR code: Sent below
 
 Hot monitoring is active for 3 minutes. The 5-minute reconciliation job then
 continues automatically.
 ```
 
-Set the QR line from `qr_delivered` exactly as described above. Only claim the
-QR was sent when `qr_delivered` is `true`.
+Set the QR line from `qr_delivery` exactly as described above. Only say the QR
+follows when `qr_delivery` is `"scheduled"`.
 
 Do not tell the operator to type `Watch <ID>`. Hot monitoring starts
 automatically after creation. The manual `recebi__recebi_watch_payment` tool

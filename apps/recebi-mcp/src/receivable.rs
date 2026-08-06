@@ -36,9 +36,9 @@ pub struct CreateRequestResult {
     qr_image_path: Option<String>,
     attachment_marker: Option<String>,
     qr_error: Option<&'static str>,
-    /// `None` when no delivery channel is configured, otherwise whether the
-    /// trusted host command accepted the QR attachment.
-    qr_delivered: Option<bool>,
+    /// `scheduled` when Recebi delivers the image itself, `unavailable` when the
+    /// reply must carry the attachment marker instead.
+    qr_delivery: Option<&'static str>,
     custody: &'static str,
     official_ptax: &'static str,
 }
@@ -56,7 +56,7 @@ pub struct RenderQrResult {
     qr_image_path: String,
     attachment_marker: String,
     png_sha256: String,
-    qr_delivered: Option<bool>,
+    qr_delivery: Option<&'static str>,
 }
 
 #[derive(Debug, Error)]
@@ -139,8 +139,7 @@ impl ReceivableService {
             &stored.solana_pay_url,
         );
         let mut result = result_from(stored, qr);
-        result.qr_delivered = self
-            .deliver_qr_if_configured(&result.receivable_id, result.attachment_marker.as_deref());
+        result.qr_delivery = self.schedule_qr_if_configured(result.attachment_marker.as_deref());
         Ok(result)
     }
 
@@ -160,30 +159,31 @@ impl ReceivableService {
             &stored.solana_pay_url,
         )
         .map_err(|error| map_qr_error(&error))?;
-        let qr_delivered = self
-            .deliver_qr_if_configured(receivable_id.as_str(), Some(&artifact.attachment_marker));
+        let qr_delivery = self.schedule_qr_if_configured(Some(&artifact.attachment_marker));
         Ok(RenderQrResult {
             receivable_id: receivable_id.as_str().to_owned(),
             state: state_name(stored.state),
             qr_image_path: artifact.path.to_string_lossy().into_owned(),
             attachment_marker: artifact.attachment_marker,
             png_sha256: artifact.png_sha256,
-            qr_delivered,
+            qr_delivery,
         })
     }
 
-    /// Delivers the QR deterministically when a channel is configured.
+    /// Schedules deterministic QR delivery when a channel is configured.
     ///
-    /// Returns `None` when no delivery channel is configured, so the caller can
-    /// distinguish "not attempted" from "attempted and failed".
-    fn deliver_qr_if_configured(
-        &self,
-        receivable_id: &str,
-        attachment_marker: Option<&str>,
-    ) -> Option<bool> {
-        let delivery = self.config.recebi.qr_delivery.as_ref()?;
+    /// `scheduled` means Recebi will send the image itself shortly. `unavailable`
+    /// means the operator must receive the marker from the reply instead.
+    fn schedule_qr_if_configured(&self, attachment_marker: Option<&str>) -> Option<&'static str> {
         let marker = attachment_marker?;
-        Some(crate::delivery::deliver_qr(delivery, receivable_id, marker))
+        let Some(delivery) = self.config.recebi.qr_delivery.as_ref() else {
+            return Some("unavailable");
+        };
+        Some(if crate::delivery::schedule_qr_delivery(delivery, marker) {
+            "scheduled"
+        } else {
+            "unavailable"
+        })
     }
 }
 
@@ -222,7 +222,7 @@ fn result_from(
         qr_image_path,
         attachment_marker,
         qr_error,
-        qr_delivered: None,
+        qr_delivery: None,
         custody: "none",
         official_ptax: "added_after_payment_when_quote_published",
     }
