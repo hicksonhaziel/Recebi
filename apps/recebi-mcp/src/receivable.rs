@@ -36,6 +36,9 @@ pub struct CreateRequestResult {
     qr_image_path: Option<String>,
     attachment_marker: Option<String>,
     qr_error: Option<&'static str>,
+    /// `None` when no delivery channel is configured, otherwise whether the
+    /// trusted host command accepted the QR attachment.
+    qr_delivered: Option<bool>,
     custody: &'static str,
     official_ptax: &'static str,
 }
@@ -53,6 +56,7 @@ pub struct RenderQrResult {
     qr_image_path: String,
     attachment_marker: String,
     png_sha256: String,
+    qr_delivered: Option<bool>,
 }
 
 #[derive(Debug, Error)]
@@ -134,7 +138,10 @@ impl ReceivableService {
             stored.request.receivable_id.as_str(),
             &stored.solana_pay_url,
         );
-        Ok(result_from(stored, qr))
+        let mut result = result_from(stored, qr);
+        result.qr_delivered = self
+            .deliver_qr_if_configured(&result.receivable_id, result.attachment_marker.as_deref());
+        Ok(result)
     }
 
     /// Render the persisted Solana Pay URL into a private, Telegram-compatible
@@ -153,13 +160,30 @@ impl ReceivableService {
             &stored.solana_pay_url,
         )
         .map_err(|error| map_qr_error(&error))?;
+        let qr_delivered = self
+            .deliver_qr_if_configured(receivable_id.as_str(), Some(&artifact.attachment_marker));
         Ok(RenderQrResult {
             receivable_id: receivable_id.as_str().to_owned(),
             state: state_name(stored.state),
             qr_image_path: artifact.path.to_string_lossy().into_owned(),
             attachment_marker: artifact.attachment_marker,
             png_sha256: artifact.png_sha256,
+            qr_delivered,
         })
+    }
+
+    /// Delivers the QR deterministically when a channel is configured.
+    ///
+    /// Returns `None` when no delivery channel is configured, so the caller can
+    /// distinguish "not attempted" from "attempted and failed".
+    fn deliver_qr_if_configured(
+        &self,
+        receivable_id: &str,
+        attachment_marker: Option<&str>,
+    ) -> Option<bool> {
+        let delivery = self.config.recebi.qr_delivery.as_ref()?;
+        let marker = attachment_marker?;
+        Some(crate::delivery::deliver_qr(delivery, receivable_id, marker))
     }
 }
 
@@ -198,6 +222,7 @@ fn result_from(
         qr_image_path,
         attachment_marker,
         qr_error,
+        qr_delivered: None,
         custody: "none",
         official_ptax: "added_after_payment_when_quote_published",
     }

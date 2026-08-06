@@ -160,6 +160,17 @@ A ZeroClaw bundle can resolve a nested `<bundle>/<skill>/SKILL.md`, so it is eas
 
 After any skill change, restart ZeroClaw and send `/new`. Session context is captured when the session starts.
 
+Optionally enable deterministic QR delivery so the operator receives the image even if the model omits the attachment marker:
+
+```toml
+[recebi.qr_delivery]
+zeroclaw_bin = "/home/OPERATOR/.cargo/bin/zeroclaw"
+channel_id = "telegram"
+recipient = "TELEGRAM_CHAT_ID"
+```
+
+Recebi then sends the QR itself and reports `qr_delivered`. Leave the block absent to keep the process boundary narrower; see [Threat model](THREAT_MODEL.md#trust-boundaries).
+
 ## 6. Install the approval SOP
 
 Copy the SOP files into the private `sops_dir` configured in ZeroClaw:

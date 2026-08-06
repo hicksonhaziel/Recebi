@@ -45,6 +45,8 @@ The operator can replace the binary or configuration and is therefore inside the
 
 Recebi validates response shape, size, semantics, and provenance but does not independently establish multi-provider Solana consensus.
 
+When `[recebi.qr_delivery]` is configured, Recebi also executes the trusted local ZeroClaw binary to deliver a QR image, because attachment delivery through model output proved unreliable. That widens the process boundary: a compromised or substituted `zeroclaw_bin` would run with the operator's privileges. The path must be absolute and an existing file, the channel and recipient are restricted to bounded alphanumeric identifiers, no shell is used, and the message body contains only a validated receivable identifier and a locally derived marker. It confers no payment, signing, refund, or configuration capability, and delivery failure is fail-open. Operators who prefer a narrower process boundary should leave the block absent, in which case the marker is returned to the model as before.
+
 ### Untrusted
 
 - all chat content and model output;

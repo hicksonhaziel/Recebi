@@ -12,3 +12,11 @@ rpc_url = "https://api.devnet.solana.com"
 data_dir = "/absolute/path/to/recebi-data"
 ptax_policy = "strict_same_day"
 max_open_reconcile = 10
+
+# Optional deterministic QR delivery. When present, Recebi sends the rendered QR
+# to the operator channel itself instead of depending on the model to emit an
+# attachment marker. It grants no payment, signing, or configuration authority.
+# [recebi.qr_delivery]
+# zeroclaw_bin = "/home/OPERATOR/.cargo/bin/zeroclaw"
+# channel_id = "telegram"
+# recipient = "TELEGRAM_CHAT_ID"

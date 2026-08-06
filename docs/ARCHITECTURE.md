@@ -231,6 +231,8 @@ Some QR and CSV results contain absolute private paths, including attachment mar
 
 There is no operation for signing, submitting, refunding, swapping, changing trusted configuration, or accepting an arbitrary transaction as exact payment.
 
+QR delivery does not depend on model output. Chat text is composed by the LLM, but an omitted attachment marker silently means the operator receives no QR code, which was observed in practice. When `[recebi.qr_delivery]` is configured, `recebi_create_request` and `recebi_render_qr` invoke the trusted local host command directly and report `qr_delivered`. The call passes fixed arguments with no shell, carries a validated receivable identifier and a locally derived marker, is bounded by a 20-second timeout, and is fail-open: a delivery failure never invalidates the created receivable or the rendered artifact. It grants no payment, signing, or configuration authority. Without that configuration, behavior is unchanged and the marker is returned for the model to emit.
+
 The binary also accepts `--verify-ledger`, which verifies the event chain, material-table root, and checkpoint chain offline and exits. It is a local operator command, not an MCP tool: it opens no server, makes no network call, mutates no state, and is unreachable from chat. `scripts/restore-drill.sh` uses it to prove a restored backup is cryptographically identical to the live ledger.
 
 ## Reconciliation architecture

@@ -26,6 +26,33 @@ pub struct TrustedConfig {
     pub data_dir: PathBuf,
     pub ptax_policy: PtaxPolicy,
     pub max_open_reconcile: u16,
+    /// Optional deterministic QR delivery. When absent, no message is sent and
+    /// the operator relies on the returned attachment marker.
+    #[serde(default)]
+    pub qr_delivery: Option<QrDeliveryConfig>,
+}
+
+/// Local host command used to deliver a rendered QR image to the operator
+/// channel without depending on model output. It carries no payment authority.
+#[derive(Clone, Deserialize)]
+pub struct QrDeliveryConfig {
+    /// Absolute path to the trusted `ZeroClaw` binary.
+    pub zeroclaw_bin: PathBuf,
+    /// Channel identifier, for example `telegram`.
+    pub channel_id: String,
+    /// Operator recipient identifier for that channel.
+    pub recipient: String,
+}
+
+impl fmt::Debug for QrDeliveryConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QrDeliveryConfig")
+            .field("zeroclaw_bin", &"[redacted]")
+            .field("channel_id", &self.channel_id)
+            .field("recipient", &"[redacted]")
+            .finish()
+    }
 }
 
 impl fmt::Debug for AppConfig {
@@ -50,6 +77,7 @@ impl fmt::Debug for TrustedConfig {
             .field("data_dir", &"[redacted]")
             .field("ptax_policy", &self.ptax_policy)
             .field("max_open_reconcile", &self.max_open_reconcile)
+            .field("qr_delivery", &self.qr_delivery)
             .finish()
     }
 }
@@ -131,6 +159,22 @@ impl AppConfig {
             || self.recebi.accepted_mint.as_str().is_empty()
         {
             return Err(ConfigError::Invalid);
+        }
+        if let Some(delivery) = self.recebi.qr_delivery.as_ref() {
+            let safe = |value: &str, limit: usize| {
+                !value.is_empty()
+                    && value.len() <= limit
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            };
+            if !delivery.zeroclaw_bin.is_absolute()
+                || !delivery.zeroclaw_bin.is_file()
+                || !safe(&delivery.channel_id, 32)
+                || !safe(&delivery.recipient, 64)
+            {
+                return Err(ConfigError::Invalid);
+            }
         }
         Ok(())
     }

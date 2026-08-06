@@ -163,6 +163,16 @@ Historical entries below preserve the terminology and tool counts that were curr
 - `concurrent_opens_all_succeed` covers both: eight threads open the store behind a barrier, each creates a distinct receivable, and the ledger verifies afterwards. It passed five consecutive runs.
 - Effect on claims: neither defect could accept an incorrect payment. Both failed closed, and the second produced a false alarm rather than a false acceptance. They degraded availability, not correctness.
 
+## 2026-08-06 — QR delivery moved off model output
+
+- Observed failure: `recebi_create_request` returned a valid `attachment_marker` with `qr_error: null`, the PNG existed on disk, and ZeroClaw 0.8.3 supports `[IMAGE:` markers, yet no QR reached Telegram.
+- Runtime traces showed the cause. The model produced the correct message structure and the correct valuation wording, proving the skill was loaded, but its reply ended before the marker line. ZeroClaw received no marker, so nothing was stripped and nothing was uploaded.
+- Two successive skill revisions failed to fix it: making the marker a required final line of the template, then adding an explicit override stating that markers are not paths to withhold. A first hypothesis — that a close-month rule forbidding filesystem paths suppressed it — was disproven by the second revision.
+- A stale nested skill copy at `shared/skills/recebi/recebi/SKILL.md` had also been shadowing the updated file, which is why earlier edits appeared to have no effect. Both copies are now synced, and the layout hazard is documented in [Installation](INSTALLATION.md).
+- Deterministic delivery through `zeroclaw channel send` was verified by hand first: the operator received the QR image.
+- Resolution: with `[recebi.qr_delivery]` configured, Recebi delivers the image itself and reports `qr_delivered`. A live create returned `qr_delivered: true` and the image arrived. Delivery is bounded, shell-free, fail-open, and grants no payment authority.
+- Interpretation: this is evidence for the project's central claim rather than against it. Chat formatting is model work and it failed; the deterministic layer held, and moving delivery there removed the failure. No payment state was ever affected.
+
 ## Evidence still required before stronger claims
 
 - a clean installation by another operator;

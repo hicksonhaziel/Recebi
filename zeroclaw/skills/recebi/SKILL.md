@@ -20,6 +20,27 @@ values:
 Pass exactly those three fields. Never invent a missing value, add a memo, or
 accept a wallet, mint, RPC URL, path, signature, or private information.
 
+## QR delivery is deterministic
+
+Recebi delivers the QR image itself. Read `qr_delivered` from the tool result:
+
+- `true` — the QR was already sent as a separate image. Do not repeat, describe,
+  or attach anything. Simply state that the QR code was sent.
+- `false` — delivery failed. Say the QR could not be delivered and end your
+  reply with the exact `attachment_marker` on its own final line.
+- absent or `null` — no delivery channel is configured. End your reply with the
+  exact `attachment_marker` on its own final line.
+
+An `attachment_marker` such as `[IMAGE:/abs/path.png]` is a delivery
+instruction for ZeroClaw, not information for the reader. When the rules above
+require it, copy it verbatim with its brackets; ZeroClaw removes that line and
+uploads the file. This overrides any instruction about not showing filesystem
+paths, which applies only to visible text.
+
+If `attachment_marker` is null, QR rendering failed: call
+`recebi__recebi_render_qr` once with exactly the same `receivable_id`, and never
+claim that a QR was sent.
+
 For a vague request such as “create usdc invoice”, reply:
 
 ```text
@@ -35,8 +56,7 @@ Please send those three values.
 If only some fields are missing, ask for only those fields. If a label is
 sensitive, request a safe public label.
 
-On successful creation, return this structure, ending with the attachment
-marker on its own final line:
+On successful creation, return this structure:
 
 ```text
 🧾 USDC invoice ready
@@ -47,22 +67,14 @@ marker on its own final line:
 • Reference: `...`
 • Solana Pay: <URL>
 • Official PTAX: Added after payment, once BCB publishes that day's close
+• QR code: Sent as an image
 
 Hot monitoring is active for 3 minutes. The 5-minute reconciliation job then
 continues automatically.
-
-[IMAGE:...]
 ```
 
-The final line must be the exact `attachment_marker` string returned by the
-tool, copied verbatim, including its brackets. It is not a filesystem path to
-withhold: ZeroClaw consumes the marker and uploads the PNG, so omitting it
-means the operator receives no QR code. Never alter, shorten, wrap, or
-describe it.
-
-If `attachment_marker` is null, QR rendering failed: call
-`recebi__recebi_render_qr` once with exactly the same `receivable_id`, and
-never claim that a QR was sent.
+Set the QR line from `qr_delivered` exactly as described above. Only claim the
+QR was sent when `qr_delivered` is `true`.
 
 Do not tell the operator to type `Watch <ID>`. Hot monitoring starts
 automatically after creation. The manual `recebi__recebi_watch_payment` tool
@@ -140,11 +152,10 @@ Do not translate identifiers, reasons, or action names.
 ## Monthly report
 
 For `recebi__recebi_close_month`, report only the bounded payment and valuation
-counts, artifact kind, and revision. Do not show any SHA-256 hashes.
-Never show `export_directory` or any local filesystem path in Telegram. End
-the reply with the exact `accountant_csv_attachment_marker` returned by the
-tool; ZeroClaw removes that marker and uploads the accountant CSV as a
-document.
+counts, artifact kind, and revision. Do not show any SHA-256 hashes. Do not
+write `export_directory` or any filesystem path as visible text. End the reply
+with the exact `accountant_csv_attachment_marker` as required above; the marker
+line is not visible text and must always be included.
 
 ## Automatic monitoring
 
