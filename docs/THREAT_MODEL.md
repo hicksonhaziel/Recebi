@@ -36,6 +36,22 @@ Protect:
 
 The operator can replace the binary or configuration and is therefore inside the trust boundary.
 
+### Named third-party dependencies
+
+Every external party the demonstrated deployment depends on, what it can observe, and what it cannot do:
+
+| Third party | Endpoint or identity | Sees | Cannot do |
+|---|---|---|---|
+| Model provider | OpenAI, provider alias `openai.default`, model `gpt-5.6-luna` | Operator chat text and bounded MCP tool arguments and results, including receivable identifiers, amounts, public labels, Solana Pay URLs, and absolute attachment paths | Establish payment state, alter trusted configuration, sign, submit, or move funds. Its output is chat text only |
+| Solana RPC | `https://api.devnet.solana.com` (single configured HTTPS endpoint) | Queried merchant token account and signature/transaction lookups | Cause acceptance of an incorrect payment. Responses are re-verified in Rust against a pinned genesis identity, the configured recipient, mint, exact atomic amount, and transfer-bound reference |
+| BCB PTAX | `https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarDia` | The operation date being valued | Affect settlement. A missing, late, malformed, or mismatched quote leaves the receivable settled and unvalued |
+| ZeroClaw runtime | Stock 0.8.3 release binary, executed locally | All model-facing content, MCP traffic, SOP approval state, and QR/CSV artifact paths | Hold keys or settle payments. It is inside the confidentiality boundary and is trusted for transport and orchestration only |
+| Telegram | Bot API over HTTPS, single private operator chat | Operator messages, agent replies, QR images, and accountant CSV attachments | Authorise a payment or a state change. Inbound chat is untrusted input |
+
+Confidentiality consequence: the model provider, ZeroClaw, and Telegram all observe invoice identifiers, amounts, and operator-supplied public labels. Recebi does not send private keys, seed phrases, or the raw SQLite ledger anywhere, and no third party can produce `payment_verified` without a finalized on-chain transfer that satisfies the full predicate.
+
+Substitution risk: a compromised RPC, PTAX source, model provider, or ZeroClaw binary degrades availability or output quality, not settlement correctness — except for `zeroclaw_bin` when `[recebi.qr_delivery]` is enabled, which executes locally with operator privileges and is disclosed below.
+
 ### Conditionally trusted and checked
 
 - the configured Solana RPC as a bounded view of finalized chain state;
