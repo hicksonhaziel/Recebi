@@ -9,3 +9,4 @@
 /recebi-data/
 *.db
 *.db-*
+dist/
