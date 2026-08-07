@@ -2,7 +2,7 @@
 
 This is the dated evidence record for Recebi. It separates observed behavior from planned work and labels self-operated devnet activity explicitly.
 
-> **Current evidence boundary:** real Telegram and ZeroClaw operation, finalized Solana devnet transfers, official BCB responses, scheduler runs, restart behavior, local approval tests, and a four-part Telegram prompt-injection transcript with unchanged ledger proof have been observed. Independent customer usage, mainnet operation, accountant acceptance, a public showcase video, and a clean-machine reproduction have not yet been established.
+> **Current evidence boundary:** real Telegram and ZeroClaw operation, finalized Solana devnet transfers, official BCB responses, scheduler runs, restart behavior, local approval tests, and a four-part Telegram prompt-injection transcript with unchanged ledger proof have been observed. A public demonstration video is published at https://youtu.be/d1HnnXwktaM. Independent customer usage, mainnet operation, accountant acceptance, and a clean-machine reproduction have not yet been established.
 
 ## Coverage summary
 
@@ -184,8 +184,7 @@ Historical entries below preserve the terminology and tool counts that were curr
 ## Evidence still required before stronger claims
 
 - a clean installation by another operator;
-- a recorded public video under three minutes;
-- an exact public commit matching the video binary;
+- an independent reproduction of the published release checksum;
 - an independent payer or genuine business receivable;
 - mainnet operation, if mainnet is claimed;
 - a recovery drill onto separate hardware, since only a same-host restore drill is validated; and
