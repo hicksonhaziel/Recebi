@@ -47,7 +47,11 @@ version=$(sed -n -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' Cargo
 target_dir="$repo_dir/target/release-artifact"
 # Remap both the repository and the Cargo registry so panic metadata cannot
 # disclose the builder's home directory or username.
-export RUSTFLAGS="--remap-path-prefix=$repo_dir=/recebi --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+export RUSTFLAGS="--remap-path-prefix=$repo_dir=/recebi"
+RUSTFLAGS+=" --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+# Inlined standard-library code re-emits panic locations from the local rust-src
+# copy, so the toolchain root is remapped too.
+RUSTFLAGS+=" --remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup"
 CARGO_TARGET_DIR="$target_dir" cargo build --locked --release -p recebi-mcp
 
 binary="$target_dir/release/recebi-mcp"
