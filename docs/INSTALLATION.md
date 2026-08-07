@@ -245,4 +245,21 @@ bash -n scripts/*.sh
 6. Restart ZeroClaw and start a new Telegram session with `/new`.
 7. Check one known open and one known settled receivable.
 
-Recebi currently has no packaged release installer or automated clean-room deployment script. It does ship an offline `--verify-ledger` mode and a non-destructive [`restore-drill.sh`](../scripts/restore-drill.sh); run both after configuration changes and before mainnet use. Reproducible source builds and a recovery procedure tested on your own separate hardware remain operator responsibilities.
+### Pinned release binary
+
+The supported path needs no Rust toolchain. Download the pinned Linux artifact, verify its checksum, and install it:
+
+```bash
+version=v0.1.0
+artifact=recebi-mcp-$version-x86_64-unknown-linux-gnu
+curl -fsSLO "https://github.com/hicksonhaziel/Recebi/releases/download/$version/$artifact"
+curl -fsSLO "https://github.com/hicksonhaziel/Recebi/releases/download/$version/$artifact.sha256"
+sha256sum -c "$artifact.sha256"
+install -Dm755 "$artifact" "$HOME/.local/bin/recebi-mcp"
+```
+
+`v0.1.0` is commit `cbc8ee8ee927080ead87c51c7121e3b194b03a0c` with SHA-256 `a88aba80aa0445408d111d71313518db520ccf2ffc18ecf67cb532d7dd1958cf`. Builder source paths are remapped out of the artifact, so it contains no home directory or username. Rebuild it yourself with `./scripts/release-artifact.sh`, which refuses to run on a dirty tree and verifies that zero builder paths remain.
+
+Point ZeroClaw's MCP `command` at the installed binary, or at `target/release/recebi-mcp` if you build from source. Both are supported; use one consistently.
+
+Recebi currently has no automated clean-room deployment script. It does ship an offline `--verify-ledger` mode and a non-destructive [`restore-drill.sh`](../scripts/restore-drill.sh); run both after configuration changes and before mainnet use. Reproducible source builds and a recovery procedure tested on your own separate hardware remain operator responsibilities.

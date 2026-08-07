@@ -173,6 +173,14 @@ Historical entries below preserve the terminology and tool counts that were curr
 - Resolution: with `[recebi.qr_delivery]` configured, Recebi delivers the image itself and reports `qr_delivered`. A live create returned `qr_delivered: true` and the image arrived. Delivery is bounded, shell-free, fail-open, and grants no payment authority.
 - Interpretation: this is evidence for the project's central claim rather than against it. Chat formatting is model work and it failed; the deterministic layer held, and moving delivery there removed the failure. No payment state was ever affected.
 
+## 2026-08-07 — Pinned release artifact
+
+- `./scripts/release-artifact.sh` builds the Linux release binary for an exact public commit, refuses to run on a dirty tree, and emits a SHA-256 checksum beside the artifact.
+- It also closes a stated plan item: verifying that no private developer path appears in the binary. The plain release build embedded the builder's home directory in 274 strings. Remapping the repository and Cargo registry reduced that to 38, all from inlined standard-library panic locations re-emitted from the local `rust-src` copy; remapping the toolchain root removed the rest. Stripping symbols did not help, because these strings live in read-only data. The script now fails closed if any remain.
+- Published `v0.1.0`: commit `cbc8ee8ee927080ead87c51c7121e3b194b03a0c`, SHA-256 `a88aba80aa0445408d111d71313518db520ccf2ffc18ecf67cb532d7dd1958cf`, 7967992 bytes, Rust 1.91.1, target `x86_64-unknown-linux-gnu`.
+- The published artifact was verified before release: checksum matched, `--version` reported `recebi-mcp 0.1.0`, `recebi_health` returned `ok`, and `--verify-ledger` verified the live event chain and checkpoint chain.
+- Boundary: this is a reproducible pinned artifact, not an independent build. It was produced on the builder's machine, and no third party has yet reproduced the checksum.
+
 ## Evidence still required before stronger claims
 
 - a clean installation by another operator;
